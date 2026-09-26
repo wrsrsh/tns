@@ -188,7 +188,7 @@ through pyte (exactly as `tns.py` does) and through `tns --dump-screen`, then
 compares every cell (character, colours, attributes) and the cursor. Two
 captures of real sessions are checked in under `tests/fixtures/`: a local
 fish 4.8 session (wrapping, wide characters, ICH/DCH/IL/DL, scroll regions,
-alternate screen) and a 100x30 session on obl (fish 3.7, htop).
+alternate screen) and a 100x30 session over ssh (fish 3.7, less).
 
 ```
 cargo test                                            # unit tests
