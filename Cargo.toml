@@ -1,0 +1,24 @@
+[package]
+name = "tns"
+version = "0.2.0"
+edition = "2021"
+description = "predictive terminal for a remote fish shell"
+license = "MIT"
+repository = "https://github.com/wrsrsh/tns"
+
+[[bin]]
+name = "tns"
+path = "src/main.rs"
+
+[dependencies]
+vte = "0.15"
+libc = "0.2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+unicode-width = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
