@@ -64,7 +64,8 @@ offers to create an ed25519 key and copy it over (one password prompt), or to
 use a password each time. It then probes the remote for its login shell and
 UTF-8 locale, installs mosh with the remote's package manager if it is
 missing, and can save a short `~/.ssh/config` alias so `tns web` works later.
-Every step prints the command it will run first.
+Every step prints the command it will run first. `./setup-demo.sh [HOST]`
+is a narrated walkthrough that runs the real wizard.
 
 ### Any shell
 
