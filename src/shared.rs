@@ -8,6 +8,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::cache::Cache;
+use crate::remote::Shell;
 
 #[derive(Default, Clone, Copy)]
 pub struct Stats {
@@ -29,6 +30,8 @@ pub struct ProbeQueue {
 
 pub struct Shared {
     pub host: String,
+    pub session_id: String,
+    pub shell: Shell,
     pub cache: Mutex<Cache>,
     pub stats: Mutex<Stats>,
     pub stopping: AtomicBool,

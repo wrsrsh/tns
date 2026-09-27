@@ -8,33 +8,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::remote::{launch_argv, Sink};
 use crate::term::Screen;
 
 /// Emits OSC marks (cwd, prompt, executed command) without a single
 /// backslash, so the snippet survives both a fish and a POSIX login shell
 /// on the remote.
-pub const FISH_INIT: &str = concat!(
-    "set -g __tns_esc (string unescape --style=url %1B); set -g __tns_bel (string unescape --style=url %07); ",
-    "function __tns_cwd --on-variable PWD; printf \"%s]7;file://%s%s%s\" $__tns_esc $hostname $PWD $__tns_bel; end; ",
-    "function __tns_prompt --on-event fish_prompt; printf \"%s]133;A%s\" $__tns_esc $__tns_bel; end; ",
-    "function __tns_post --on-event fish_postexec; printf \"%s]7770;%s%s\" $__tns_esc (string escape --style=url -- $argv[1]) $__tns_bel; end; ",
-    "__tns_cwd"
-);
-
-/// Same events, but appended to a file on the server instead of OSC marks
-/// (mosh's terminal emulator drops unknown OSC sequences).  Read back with
-/// `EventChannel`.
-pub fn fish_init_file(path: &str) -> String {
-    let q = fish_quote(path);
-    format!(
-        "function __tns_cwd --on-variable PWD; echo D (string escape --style=url -- $PWD) >> {q}; end; \
-         function __tns_prompt --on-event fish_prompt; echo P >> {q}; end; \
-         function __tns_post --on-event fish_postexec; echo X (string escape --style=url -- $argv[1]) >> {q}; end; \
-         function __tns_exit --on-event fish_exit; rm -f {q}; end; \
-         __tns_cwd"
-    )
-}
-
 pub fn fish_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
@@ -188,18 +167,15 @@ impl Emulator {
                 if let Some((code, arg, end)) = parse_osc(buf, i) {
                     let arg_b = &buf[arg.clone()];
                     match code {
-                        7 => {
-                            self.cwd = if arg_b.windows(2).any(|w| w == b"//") {
-                                // file://host/path -> /path
-                                let s = url_unquote(arg_b);
-                                s.splitn(4, '/').nth(3).map(|p| format!("/{}", p))
-                            } else {
-                                None
-                            };
-                        }
                         133 if arg_b.first() == Some(&b'A') => self.events.push_back(Event::Prompt),
-                        7770 => {
-                            self.events.push_back(Event::Exec(url_unquote(arg_b)));
+                        7770 | 7771 => {
+                            let text = url_unquote(arg_b);
+                            if code == 7770 {
+                                self.events.push_back(Event::Exec(text));
+                            } else {
+                                self.cwd = Some(text.clone());
+                                self.events.push_back(Event::Cwd(text));
+                            }
                             out.extend_from_slice(&buf[pos..i]);
                             pos = end;
                         }
@@ -299,7 +275,13 @@ impl Drop for Pty {
     }
 }
 
-/// ssh session to `host` running fish with the tns init snippet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Transport {
+    Ssh,
+    Mosh,
+}
+
+/// A session to `host` running the hooked shell prepared by `remote`.
 pub struct Session {
     pub pty: Pty,
     pub em: Emulator,
@@ -323,38 +305,30 @@ pub fn ssh_base(host: &str) -> Vec<String> {
 }
 
 impl Session {
-    pub fn open(host: &str, cols: usize, rows: usize, cwd: Option<&str>) -> io::Result<Session> {
-        let mut remote = format!("exec fish -C {}", fish_quote(FISH_INIT));
-        if let Some(c) = cwd {
-            remote = format!("cd {}; {}", fish_quote(c), remote);
-        }
-        let mut argv = ssh_base(host);
-        argv.insert(1, "-t".into());
-        argv.push(remote);
-        let pty = Pty::spawn(&argv, cols, rows)?;
-        Ok(Session { pty, em: Emulator::new(cols, rows), cols, rows })
-    }
-
-    /// Same session over mosh (UDP, roaming).  Mosh's own prediction is off:
-    /// its speculative echo would otherwise be learned as fish's redraw.
-    /// Events come through `event_path` on the server, see `EventChannel`.
-    pub fn open_mosh(host: &str, cols: usize, rows: usize, event_path: &str) -> io::Result<Session> {
-        let ssh = ssh_base(host);
-        let argv = vec![
-            "mosh".to_string(),
-            "--predict=never".into(),
-            format!("--ssh={}", ssh[..ssh.len() - 1].join(" ")),
-            host.into(),
-            "--".into(),
-            "fish".into(),
-            "-C".into(),
-            // mosh shell-quotes every argument itself (POSIX style, which a
-            // fish login shell also reads correctly), so pass the snippet raw.
-            fish_init_file(event_path),
-        ];
+    /// Start the hooked shell of session `id` over `transport`.  Mosh's own
+    /// prediction is off: its speculative echo would otherwise be learned as
+    /// the shell's redraw.
+    pub fn open(host: &str, cols: usize, rows: usize, transport: Transport, id: &str, sink: &Sink, cwd: Option<&str>) -> io::Result<Session> {
+        let launch = launch_argv(id, sink, cwd);
+        let argv = match transport {
+            Transport::Ssh => {
+                let mut v = ssh_base(host);
+                v.insert(1, "-t".into());
+                v.extend(launch);
+                v
+            }
+            Transport::Mosh => {
+                let ssh = ssh_base(host);
+                let mut v = vec!["mosh".to_string(), "--predict=never".into(), format!("--ssh={}", ssh[..ssh.len() - 1].join(" ")), host.into(), "--".into()];
+                v.extend(launch);
+                v
+            }
+        };
         let pty = Pty::spawn(&argv, cols, rows)?;
         let mut em = Emulator::new(cols, rows);
-        em.screen.track_alt = false;
+        if transport == Transport::Mosh {
+            em.screen.track_alt = false; // mosh-client draws inside the alternate screen
+        }
         Ok(Session { pty, em, cols, rows })
     }
 
@@ -485,9 +459,10 @@ mod tests {
     fn osc_events_and_stripping() {
         let mut em = Emulator::new(20, 2);
         let mut out = Vec::new();
-        em.feed(b"a\x1b]7;file://h/tmp/x%20y\x07b\x1b]133;A\x07c\x1b]7770;ls%20-l\x1b\\d", &mut out);
-        assert_eq!(out, b"a\x1b]7;file://h/tmp/x%20y\x07b\x1b]133;A\x07cd");
+        em.feed(b"a\x1b]7771;/tmp/x%20y\x07b\x1b]133;A\x07c\x1b]7770;ls%20-l\x1b\\d", &mut out);
+        assert_eq!(out, b"ab\x1b]133;A\x07cd");
         assert_eq!(em.cwd.as_deref(), Some("/tmp/x y"));
+        assert!(matches!(em.events.pop_front(), Some(Event::Cwd(_))));
         assert!(matches!(em.events.pop_front(), Some(Event::Prompt)));
         assert!(matches!(em.events.pop_front(), Some(Event::Exec(s)) if s == "ls -l"));
         assert_eq!(em.screen.grid.row(0)[3].chr(), Some('d'));

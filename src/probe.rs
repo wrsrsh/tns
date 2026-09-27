@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::cache::{key_hash, state_hash, Anchor};
-use crate::session::{poll_read, Event, Session};
+use crate::remote::Sink;
+use crate::session::{poll_read, Event, Session, Transport};
 use crate::shared::Shared;
 use crate::term::Grid;
 
@@ -70,7 +71,7 @@ impl Prober {
         let (cols, rows) = *self.shared.size.lock().unwrap();
         self.size = (cols, rows);
         let cwd = self.shared.cwd.lock().unwrap().clone();
-        let mut sess = match Session::open(&self.shared.host, cols, rows, cwd.as_deref()) {
+        let mut sess = match Session::open(&self.shared.host, cols, rows, Transport::Ssh, &self.shared.session_id, &Sink::Osc, cwd.as_deref()) {
             Ok(s) => s,
             Err(e) => {
                 self.log(&format!("spawn failed: {}", e));
@@ -78,11 +79,14 @@ impl Prober {
             }
         };
         let t0 = Instant::now();
+        let hooks = self.shared.shell.has_hooks();
         while t0.elapsed() < Duration::from_secs(10) {
-            if wait_quiet(&mut sess, &mut self.buf, &mut self.scratch, Duration::from_secs(2), Duration::from_millis(150)) < 0 {
+            let got = wait_quiet(&mut sess, &mut self.buf, &mut self.scratch, Duration::from_secs(2), Duration::from_millis(150));
+            if got < 0 {
                 break;
             }
-            if sess.em.events.iter().any(|e| matches!(e, Event::Prompt)) {
+            // without hooks, a quiet screen with a cursor is the best prompt signal we have
+            if sess.em.events.iter().any(|e| matches!(e, Event::Prompt)) || (!hooks && got > 0 && sess.em.screen.grid.cx > 0) {
                 sess.em.events.clear();
                 wait_quiet(&mut sess, &mut self.buf, &mut self.scratch, Duration::from_millis(200), Duration::from_millis(150));
                 self.anchor = (sess.em.screen.grid.cy, sess.em.screen.grid.cx);

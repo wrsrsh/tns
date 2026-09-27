@@ -1,32 +1,45 @@
 # tns
 
-A predictive terminal for a remote fish shell. The real shell stays on the
+A predictive terminal for a remote shell. The real shell stays on the
 server; the local side keeps a cache of how that shell redraws the screen for
 each keystroke and paints from the cache instantly, then reconciles when the
-real bytes arrive.
+real bytes arrive. It runs over mosh by default (UDP, roaming, reconnect) and
+falls back to ssh.
 
 Mosh predicts only plain character echo. With fish, starship and friends every
 key triggers a redraw (autosuggestion, syntax colours, abbreviations), so mosh
 either waits a round trip or shows an underlined guess. tns learns the whole
-redraw, so the frame you see after a keystroke is the final one.
+redraw, so the frame you see after a keystroke is the final one. bash, zsh and
+fish get full prompt/command tracking; any other shell works with a generic
+fallback.
 
 The Rust implementation is the real thing; the original Python prototype
 (`tns.py`) is kept as the reference for differential tests and benchmarks.
 
 ## Install
 
+One line installs tns and mosh, then walks you through your first host:
+
 ```sh
-brew install wrsrsh/tap/tns        # macOS or Linux; builds from source (pulls rust as a build dep)
-cargo install --git https://github.com/wrsrsh/tns   # or, with a Rust toolchain
+curl -fsSL https://raw.githubusercontent.com/wrsrsh/tns/main/install.sh | sh
 ```
 
-On the remote host you need **fish** (any login shell is fine; tns starts fish
-itself). For `--mosh` you also need mosh on both ends, see below.
+Or install by hand:
 
 ```sh
-tns HOST            # HOST as you would give it to ssh (~/.ssh/config aliases work)
-tns --mosh HOST     # same session carried over mosh (UDP, roaming, reconnect)
-tns HOST --debug    # also logs to ~/.cache/tns/debug.log
+brew install wrsrsh/tap/tns                          # macOS or Linux (Homebrew); pulls mosh + a rust build toolchain
+cargo install --git https://github.com/wrsrsh/tns    # with a Rust toolchain (install mosh separately)
+```
+
+The remote host needs a shell (bash, zsh, fish, or anything else) and, for the
+default mosh transport, `mosh` on both ends. `tns setup` installs mosh for you.
+
+```sh
+tns setup           # interactive: pick a host, set up an ssh key, install mosh, save an alias
+tns HOST            # connect (mosh by default). HOST is anything ssh accepts; ~/.ssh/config aliases work
+tns --ssh HOST      # use plain ssh instead of mosh
+tns --shell bash HOST   # force a remote shell instead of the login shell
+tns HOST --debug    # also log to ~/.cache/tns/debug.log
 ```
 
 Type as usual. The first connect to a host spends ~12 s calibrating in the
@@ -35,49 +48,76 @@ is kept in `~/.cache/tns/` and reused. Exit with `exit` or ctrl-d; a one-line
 stats summary is printed.
 
 ```
-tns [--mosh] [--probes N] [--calib-seconds S] [--history N] [--debug] HOST
-  --mosh              carry the session over mosh instead of ssh
+tns [--ssh] [--shell NAME] [--probes N] [--calib-seconds S] [--history N] [--debug] HOST
+  --ssh               carry the session over plain ssh instead of mosh (the default)
+  --shell NAME        remote shell to start (bash, zsh, fish, ...); default: the login shell
   --probes N          hidden calibration sessions (default 6)
   --calib-seconds S   burst calibration time; afterwards one probe keeps learning (default 12)
   --history N         how many recent history entries to learn (default 400)
 ```
 
-### Setting up mosh
+### tns setup
 
-1. Local: `brew install mosh` (the Homebrew formula installs it for you).
+`tns setup [HOST]` is an interactive wizard. It lists your `~/.ssh/config`
+hosts (or takes a new `user@host`), checks whether you can log in, and if not
+offers to create an ed25519 key and copy it over (one password prompt), or to
+use a password each time. It then probes the remote for its login shell and
+UTF-8 locale, installs mosh with the remote's package manager if it is
+missing, and can save a short `~/.ssh/config` alias so `tns web` works later.
+Every step prints the command it will run first.
+
+### Any shell
+
+tns starts your login shell by default and adapts how it tracks the prompt:
+
+- **bash, zsh, fish** get an uploaded hook (a `PROMPT_COMMAND`, a `precmd`
+  hook, or fish events) that marks each prompt and reports the command you ran
+  and the working directory. Predictions and per-command re-probing are fully
+  supported.
+- **any other shell** runs unhooked: tns treats the command line on screen as
+  the executed command and the next quiet screen as the next prompt. Echo and
+  autosuggestions are still predicted; there is just no cwd tracking.
+
+Hooks are uploaded to a per-session directory under `/tmp/tns-<id>` on the
+remote and removed on exit; they never touch your dotfiles.
+
+### Transport: mosh (default) or ssh
+
+By default the session runs over `mosh --predict=never`, so you get everything
+mosh provides natively: UDP with roaming across networks and sleep, automatic
+reconnection, frame-rate screen sync that never falls behind a flood of
+output, and the "mosh: waiting" status line when the link is down. tns predicts
+on top of what mosh-client draws. `--ssh` uses a plain `ssh -t` pty instead.
+
+Mosh's own prediction (the underlined local echo) is switched off: mosh
+only guesses the bare character, while tns paints the full redraw, and if
+mosh's speculative echo were visible tns would learn it as the shell's real
+output. Keys tns does not know wait one round trip, as with ssh.
+
+Two things differ under the hood in mosh mode. Mosh's server-side terminal
+emulator drops the OSC marks tns uses to detect prompts, so in mosh mode the
+shell hook appends its prompt / command / cwd events to a file on the server
+(inside `/tmp/tns-<id>`, removed on exit) and tns follows it with `tail -F`
+over a multiplexed ssh side channel that reconnects by itself. And mosh-client
+draws inside the alternate screen, so the model treats that as the primary
+screen; remote TUIs are still passed through, prediction just pauses because no
+prompt is on screen. The calibration probes always use ssh multiplexing,
+whatever the main transport.
+
+### Setting up mosh by hand
+
+`tns setup` does this for you, but if you prefer:
+
+1. Local: `brew install mosh`, or your package manager on Linux.
 2. Remote: `sudo apt install mosh` (Debian/Ubuntu), `sudo dnf install mosh`
    (Fedora), `sudo pacman -S mosh` (Arch), `brew install mosh` (macOS).
 3. Open UDP ports 60000-61000 inbound on the server if it has a firewall,
    e.g. `sudo ufw allow 60000:61000/udp`. Over Tailscale or WireGuard nothing
    needs opening.
-4. Both sides need a UTF-8 locale. If mosh complains about the locale, on the
-   server run `sudo locale-gen en_US.UTF-8` (Debian: `sudo dpkg-reconfigure
-   locales`) and make sure `LANG` is set in your fish config.
-5. Check that plain `mosh HOST` works, then use `tns --mosh HOST`.
-
-### Transport: ssh or mosh
-
-By default the interactive session is one `ssh -t` pty. With `--mosh` it is
-`mosh --predict=never host -- fish -C ...` instead, so you get everything
-mosh provides natively: UDP with roaming across networks and sleep, automatic
-reconnection, frame-rate screen sync that never falls behind a flood of
-output, and the "mosh: waiting" status line when the link is down. tns then
-predicts on top of what mosh-client draws, exactly as it does on ssh bytes.
-
-Mosh's own prediction (the underlined local echo) is switched off: mosh
-only guesses the bare character, while tns paints the full redraw, and if
-mosh's speculative echo were visible tns would learn it as fish's real
-output. Keys that tns does not know wait one round trip, as with ssh.
-
-Two things are different under the hood in mosh mode. Mosh's server-side
-terminal emulator drops the OSC marks tns uses to detect prompts, so the
-fish snippet appends its prompt / exec / cwd events to a file on the server
-(`/tmp/tns-ev-<id>`, removed when fish exits) and tns follows it with
-`tail -F` over a multiplexed ssh side channel that reconnects by itself if it
-drops. And mosh-client draws inside the terminal's alternate screen, so the
-model treats that as the primary screen; remote TUIs are still passed
-through, prediction just pauses because no prompt is on screen. The
-calibration probes always use ssh multiplexing, whatever the main transport.
+4. Both sides need a UTF-8 locale. If mosh complains, on the server run
+   `sudo locale-gen en_US.UTF-8` (Debian: `sudo dpkg-reconfigure locales`) and
+   set `LANG`.
+5. Check that plain `mosh HOST` works, then use `tns HOST`.
 
 ## How it works
 
@@ -85,9 +125,10 @@ calibration probes always use ssh multiplexing, whatever the main transport.
    server goes to your terminal untouched, so scrollback, colours and TUIs are
    exactly what ssh would give you. A local terminal model (`src/term.rs`)
    tracks the confirmed remote screen.
-2. **Anchor.** The remote fish is started with a tiny `-C` snippet that emits
-   an OSC mark before each prompt and reports the executed command line after
-   each command. When a prompt settles, the cursor position becomes the
+2. **Anchor.** The remote shell is started with an uploaded hook that emits a
+   mark before each prompt and reports the executed command line after each
+   command (bash/zsh/fish; other shells derive the same from Enter and screen
+   quiescence). When a prompt settles, the cursor position becomes the
    *anchor*: where your input starts.
 3. **Cache.** A state is the text from the anchor to the end of the
    autosuggestion (the right prompt clock is masked out), plus the cursor
@@ -103,13 +144,14 @@ calibration probes always use ssh multiplexing, whatever the main transport.
    overlay is restored and the real bytes win. Several keys can be in flight;
    each carries its expected state so bursts of typing ack correctly.
 5. **Calibrate.** On connect, N hidden ssh sessions (multiplexed over the same
-   connection, so they start in ~0.5 s) open the same fish in the same
+   connection, so they start in ~0.5 s) open the same shell in the same
    directory and type your history into it, char by char, never pressing
    Enter, learning every transition. By default 6 probes run for 12 s, then
    one keeps going in the background. Every command you execute is re-probed
    immediately (its autosuggestion just changed), and every unknown key you
    press is learned live from the real session. The cache is saved to
-   `~/.cache/tns/<host>.bin` and reloaded next time.
+   `~/.cache/tns/<host>.bin` and reloaded next time. History comes from the
+   remote shell's own history file (bash/zsh/fish).
 
 Anything that owns the terminal (nvim, htop, ...) is passed through with plain
 ssh latency; the alternate screen is detected and prediction pauses until the
@@ -186,11 +228,11 @@ in history) with a warm cache:
 | mosh | 0 ms | 0 ms | 129 ms | |
 | tns (python) | 6 ms | 6 ms | 30 ms | 33 MB |
 | tns (rust) | 0 ms | 0 ms | 0 ms | 3.9 MB |
-| tns (rust, --mosh) | 0 ms | 0 ms | 0 ms | 3.9 MB + mosh's 19 MB |
+| tns (rust, mosh) | 0 ms | 0 ms | 0 ms | 3.9 MB + mosh's 19 MB |
 
 Mosh's 0 ms is the underlined bare character; its p90 is the autosuggestion
 and colours arriving a round trip later (its *median* final frame for
-`ls -la`, where every key changes the suggestion, is 100 ms). `tns --mosh`
+`ls -la`, where every key changes the suggestion, is 100 ms). tns over mosh
 keeps mosh's transport and replaces its prediction: in two runs of the same
 workload all 22 keys were predicted and confirmed, and every frame was final
 at 0 ms. The Python version spends ~2 ms per
@@ -232,7 +274,8 @@ bold+underline and then erases with those attributes.
 
 ## Known limits
 
-- Only fish on the remote is supported (the `-C` init snippet is fish).
+- bash, zsh and fish get full prompt/command hooks; other shells use a generic
+  fallback (echo and suggestions are predicted, but there is no cwd tracking).
 - The state key ignores the working directory, so a `cd` suggestion learned in
   one directory may be predicted in another; the real bytes correct it within
   one round trip and the cache is updated.

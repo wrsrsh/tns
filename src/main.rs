@@ -11,7 +11,9 @@ mod agent;
 mod cache;
 mod paint;
 mod probe;
+mod remote;
 mod session;
+mod setup;
 mod shared;
 mod term;
 
@@ -19,7 +21,6 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,7 +28,8 @@ use std::time::{Duration, Instant};
 use cache::{key_hash, state_hash, Anchor, Cache, Key};
 use paint::{cup, RunWriter};
 use probe::Prober;
-use session::{poll_read, ssh_base, Emulator, Event, EventChannel, Session};
+use remote::{Shell, Sink};
+use session::{poll_read, Emulator, Event, EventChannel, Session, Transport};
 use shared::{Shared, Stats};
 use term::Grid;
 
@@ -39,7 +41,8 @@ struct Args {
     debug: bool,
     dump: Option<(usize, usize)>,
     bench: Option<PathBuf>,
-    mosh: bool,
+    ssh: bool,
+    shell: Option<String>,
 }
 
 fn usage() -> ! {
@@ -48,22 +51,24 @@ fn usage() -> ! {
 
 fn usage_exit(code: i32) -> ! {
     eprintln!(
-        "usage: tns [--mosh] [--probes N] [--calib-seconds S] [--history N] [--debug] HOST\n\
+        "usage: tns [--ssh] [--shell NAME] [--probes N] [--calib-seconds S] [--history N] [--debug] HOST\n\
          \x20      tns --dump-screen COLSxROWS < bytes   (emulator test mode)\n\
          \x20      tns --bench CAPTURE.bin               (micro benchmarks)\n\
-         \x20      tns agent <claude|codex|pi|opencode> HOST   (local UI for a remote agent, see tns agent --help)\n\n\
+         \x20      tns agent <claude|codex|pi|opencode> HOST   (local UI for a remote agent, see tns agent --help)\n\
+         \x20      tns setup [HOST]                     (interactive: keys, mosh install, ssh config)\n\n\
          predictive terminal for a remote fish shell\n\n\
          --probes N          hidden calibration sessions (default 6)\n\
          --calib-seconds S   burst calibration time; afterwards one probe keeps learning (default 12)\n\
          --history N         how many recent history entries to learn (default 400)\n\
-         --mosh              carry the session over mosh (UDP, roaming) instead of ssh\n\
+         --ssh               carry the session over plain ssh instead of mosh (the default)\n\
+         --shell NAME        remote shell to start (bash, zsh, fish, ...); default: the login shell\n\
          --debug             log to ~/.cache/tns/debug.log"
     );
     std::process::exit(code)
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { host: String::new(), probes: 6, calib_seconds: 12.0, history: 400, debug: false, dump: None, bench: None, mosh: false };
+    let mut a = Args { host: String::new(), probes: 6, calib_seconds: 12.0, history: 400, debug: false, dump: None, bench: None, ssh: false, shell: None };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let val = |it: &mut dyn Iterator<Item = String>| it.next().unwrap_or_else(|| usage());
@@ -72,7 +77,16 @@ fn parse_args() -> Args {
             "--calib-seconds" => a.calib_seconds = val(&mut it).parse().unwrap_or_else(|_| usage()),
             "--history" => a.history = val(&mut it).parse().unwrap_or_else(|_| usage()),
             "--debug" => a.debug = true,
-            "--mosh" => a.mosh = true,
+            "--ssh" => a.ssh = true,
+            "--mosh" => a.ssh = false,
+            "--shell" => a.shell = Some(val(&mut it)),
+            "--print-hooks" => {
+                // debugging aid: tns --print-hooks bash osc
+                let sh = Shell::from_name(&val(&mut it));
+                let sink = if val(&mut it) == "file" { Sink::File("/tmp/tns-events".into()) } else { Sink::Osc };
+                print!("{}", remote::hooks(sh, &sink));
+                std::process::exit(0)
+            }
             "--dump-screen" => {
                 let v = val(&mut it);
                 let (c, r) = v.split_once('x').unwrap_or_else(|| usage());
@@ -305,20 +319,13 @@ impl Client {
             .name("coordinator".into())
             .stack_size(256 * 1024)
             .spawn(move || {
-                let mut argv = ssh_base(&shared.host);
-                argv.push("fish -c history".into());
                 let (tx, rx) = std::sync::mpsc::channel();
-                let argv2 = argv.clone();
+                let (h, sh) = (shared.host.clone(), shared.shell);
                 std::thread::spawn(move || {
-                    let r = Command::new(&argv2[0]).args(&argv2[1..]).stdin(Stdio::null()).stderr(Stdio::null()).output();
-                    let _ = tx.send(r);
+                    let _ = tx.send(remote::history(&h, sh, history));
                 });
                 let lines: Vec<String> = match rx.recv_timeout(Duration::from_secs(20)) {
-                    Ok(Ok(o)) => String::from_utf8_lossy(&o.stdout).lines().map(|s| s.to_string()).collect(),
-                    Ok(Err(e)) => {
-                        shared.log(&format!("history fetch failed: {}", e));
-                        Vec::new()
-                    }
+                    Ok(l) => l,
                     Err(_) => {
                         shared.log("history fetch timed out");
                         Vec::new()
@@ -409,6 +416,14 @@ impl Client {
     /// so that output already counts as "after the prompt".
     fn handle_events(&mut self, in_band: bool) {
         while let Some(ev) = self.sess.em.events.pop_front() {
+            if self.shared.log.lock().map(|g| g.is_some()).unwrap_or(false) {
+                let name = match &ev {
+                    Event::Prompt => "prompt".to_string(),
+                    Event::Exec(c) => format!("exec {:?}", c),
+                    Event::Cwd(c) => format!("cwd {:?}", c),
+                };
+                self.log(&format!("event {} (in_band={}) cursor=({}, {})", name, in_band, self.sess.em.screen.grid.cy, self.sess.em.screen.grid.cx));
+            }
             match ev {
                 Event::Prompt => {
                     self.pending_anchor = true;
@@ -427,6 +442,21 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Text from the anchor to the end of the anchor row (the typed command).
+    fn anchor_row_text(&self) -> String {
+        let g = &self.sess.em.screen.grid;
+        let (ay, ax) = self.anchor;
+        if ay >= g.rows {
+            return String::new();
+        }
+        let row = g.row(ay);
+        let mut s: String = row[ax.min(g.cols)..].iter().filter_map(|c| c.chr()).collect();
+        if let Some(i) = s.find("    ") {
+            s.truncate(i);
+        }
+        s.trim().to_string()
     }
 
     fn clear_prediction(&mut self) {
@@ -537,6 +567,20 @@ impl Client {
                     self.shared.with_stats(|s| s.keys += 1);
                     if matches!(unit, b"\r" | b"\n" | b"\x03" | b"\x04" | b"\x0c") {
                         self.restore_overlay();
+                        if !self.shared.shell.has_hooks() {
+                            // no shell hooks: the command line on screen is the executed
+                            // command, and the next quiet screen is the next prompt
+                            if self.anchor_valid && matches!(unit, b"\r" | b"\n") {
+                                let cmd = self.anchor_row_text();
+                                self.shared.enqueue(&cmd, true);
+                            }
+                            self.pending_anchor = true;
+                            self.prompt_t = Instant::now();
+                            if !self.probes_started {
+                                self.probes_started = true;
+                                self.start_probes();
+                            }
+                        }
                         self.clear_prediction();
                         self.anchor_valid = false;
                         self.flush();
@@ -586,7 +630,7 @@ impl Client {
             // beat the screen bytes, and mosh splits fish's prompt drawing
             // across frames: wait for output after the event, a longer quiet
             // window, and a screen that is not blank before taking the anchor.
-            let anchor_quiet = Duration::from_millis(if self.args.mosh { 120 } else { 40 });
+            let anchor_quiet = Duration::from_millis(if !self.shared.shell.has_hooks() { 250 } else if !self.args.ssh { 120 } else { 40 });
             let anchor_ok = self.last_out.map_or(false, |lo| now.duration_since(lo) >= anchor_quiet && lo >= self.prompt_t)
                 && self.sess.em.screen.grid.cells.iter().any(|c| *c != Grid::BLANK_CELL);
             if self.pending_anchor && anchor_ok && !self.sess.em.screen.alt {
@@ -596,6 +640,10 @@ impl Client {
                 self.anchor_valid = true;
                 let cwd = self.sess.em.cwd.clone();
                 self.log(&format!("anchor={:?} cwd={:?}", self.anchor, cwd));
+                if !self.probes_started && !self.shared.shell.has_hooks() {
+                    self.probes_started = true;
+                    self.start_probes();
+                }
             }
             if !self.inflight.is_empty() && quiet && self.anchor_valid {
                 let (expected, seen, has_snap, t, single) = {
@@ -681,6 +729,14 @@ fn main() {
         }
         return;
     }
+    if raw.get(1).map(|s| s.as_str()) == Some("setup") {
+        let host = raw.get(2).filter(|s| !s.starts_with('-')).cloned();
+        if let Err(e) = setup::run(host) {
+            eprintln!("tns setup: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
     let args = parse_args();
     if let Some((c, r)) = args.dump {
         dump_screen(c, r);
@@ -697,8 +753,39 @@ fn main() {
     let _ = fs::create_dir_all(&dir);
     let logf: Option<File> = if args.debug { OpenOptions::new().create(true).append(true).open(dir.join("debug.log")).ok() } else { None };
     let size = term_size();
+    let session_id = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+    let transport = if args.ssh { Transport::Ssh } else { Transport::Mosh };
+    let shell_path = match &args.shell {
+        Some(s) => s.clone(),
+        None => match remote::detect_shell(&args.host) {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => "sh".into(),
+            Err(e) => {
+                eprintln!("tns: cannot reach {}: {} (is ssh key auth set up? try `tns setup {}`)", args.host, e, args.host);
+                std::process::exit(1);
+            }
+        },
+    };
+    let shell = Shell::from_name(&shell_path);
+    if args.debug {
+        eprintln!("tns: remote shell {} ({})", shell_path, shell.name());
+    }
+    let info = match remote::prepare(&args.host, &session_id, shell, &shell_path) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("tns: cannot prepare {}: {}", args.host, e);
+            std::process::exit(1);
+        }
+    };
+    if transport == Transport::Mosh && !info.mosh_server {
+        eprintln!("tns: mosh-server is not installed on {}. Run `tns setup {}` to install it, or use `tns --ssh {}`.", args.host, args.host, args.host);
+        remote::cleanup(&args.host, &session_id);
+        std::process::exit(1);
+    }
     let shared = Arc::new(Shared {
         host: args.host.clone(),
+        session_id: session_id.clone(),
+        shell,
         cache: Mutex::new(Cache::load(&dir.join(format!("{}.bin", args.host)))),
         stats: Mutex::new(Stats::default()),
         stopping: AtomicBool::new(false),
@@ -709,16 +796,16 @@ fn main() {
         log: Mutex::new(logf),
         t0: Instant::now(),
     });
-    let event_path = format!("/tmp/tns-ev-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
-    let opened = if args.mosh { Session::open_mosh(&args.host, size.0, size.1, &event_path) } else { Session::open(&args.host, size.0, size.1, None) };
-    let sess = match opened {
+    let event_path = remote::event_file(&session_id);
+    let sink = if transport == Transport::Mosh { Sink::File(event_path.clone()) } else { Sink::Osc };
+    let sess = match Session::open(&args.host, size.0, size.1, transport, &session_id, &sink, None) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("tns: cannot start {}: {}", if args.mosh { "mosh" } else { "ssh" }, e);
+            eprintln!("tns: cannot start {}: {}", if args.ssh { "ssh" } else { "mosh" }, e);
             std::process::exit(1);
         }
     };
-    let chan = if args.mosh {
+    let chan = if transport == Transport::Mosh {
         match EventChannel::start(&args.host, &event_path) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -758,6 +845,7 @@ fn main() {
     if let Some(c) = &client.chan {
         c.stop();
     }
+    remote::cleanup(&shared.host, &session_id);
     drop(raw);
     write_all(1, b"\x1b[0m\r\n");
     let _ = shared.cache.lock().unwrap().save();
