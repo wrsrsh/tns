@@ -135,6 +135,35 @@ path:
   instead of keeping a second grid; the primary screen and cursor are simply
   left untouched until the app exits.
 
+## Agents: local UI for a remote Claude Code, Codex, pi or opencode
+
+A streaming agent TUI is the worst case for any remote terminal: the input
+box, scrolling and permission prompts all wait a round trip, and the token
+stream arrives in RTT-sized chunks. `tns agent` sidesteps the terminal
+entirely: the agent runs headless on the remote in its structured stdio mode
+and tns renders it locally.
+
+```sh
+tns agent claude obl --cwd ~/proj        # Claude Code (stream-json)
+tns agent codex obl --cwd ~/proj         # Codex (app-server protocol)
+tns agent pi obl                         # pi (RPC mode)
+tns agent opencode obl                   # opencode (serve + SSE over an ssh port forward)
+tns agent claude obl --resume SESSION    # continue a session (id is printed on exit)
+tns agent claude --local                 # run the agent on this machine instead
+tns agent claude obl -- --model sonnet   # anything after -- goes to the agent
+```
+
+What is local: the editor (multi-line, history, word ops), scrolling, the
+permission prompt (`y` once, `a` always, `n` deny), and interrupts (Esc).
+What crosses the wire: your submitted message, the answer to a prompt, an
+interrupt, and the agent's events (token deltas, tool calls and results,
+cost). Tool output is summarised to a few lines; anything the agent runs
+that needs a real terminal is not shown here, use a plain `tns HOST` for
+that. If the ssh link drops, `ctrl-r` reconnects and resumes the session.
+
+Transport is ssh (multiplexed with the shell sessions), since the agents
+speak over reliable pipes; roaming for agent sessions is on the list.
+
 ## Measure it
 
 `bench.py` runs a terminal program in a pty, types a command one key at a

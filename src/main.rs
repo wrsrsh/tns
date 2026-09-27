@@ -7,6 +7,7 @@
 //! by hidden probe sessions that type your history into the remote shell,
 //! and it keeps learning from every keystroke you type.
 
+mod agent;
 mod cache;
 mod paint;
 mod probe;
@@ -49,7 +50,8 @@ fn usage_exit(code: i32) -> ! {
     eprintln!(
         "usage: tns [--mosh] [--probes N] [--calib-seconds S] [--history N] [--debug] HOST\n\
          \x20      tns --dump-screen COLSxROWS < bytes   (emulator test mode)\n\
-         \x20      tns --bench CAPTURE.bin               (micro benchmarks)\n\n\
+         \x20      tns --bench CAPTURE.bin               (micro benchmarks)\n\
+         \x20      tns agent <claude|codex|pi|opencode> HOST   (local UI for a remote agent, see tns agent --help)\n\n\
          predictive terminal for a remote fish shell\n\n\
          --probes N          hidden calibration sessions (default 6)\n\
          --calib-seconds S   burst calibration time; afterwards one probe keeps learning (default 12)\n\
@@ -628,7 +630,57 @@ impl Client {
     }
 }
 
+fn agent_usage() -> ! {
+    eprintln!(
+        "usage: tns agent <claude|codex|pi|opencode> HOST [--cwd DIR] [--resume ID] [-- AGENT_ARGS...]\n\
+         \x20      tns agent <agent> --local [...]        run the agent on this machine\n\n\
+         Runs the agent headless on HOST and renders it here: the input box, scrolling and\n\
+         permission prompts are local, only your messages and interrupts cross the wire.\n\n\
+         keys: Enter send · alt-Enter newline · Esc interrupt · y/a/n answer a permission prompt\n\
+         \x20     PageUp/PageDown scroll · ctrl-r reconnect · ctrl-c twice or ctrl-d quit"
+    );
+    std::process::exit(2)
+}
+
+fn parse_agent_args(argv: &[String]) -> agent::AgentArgs {
+    let mut kind = None;
+    let mut host = None;
+    let mut a = agent::AgentArgs { kind: agent::proto::Kind::Claude, host: String::new(), local: false, cwd: None, resume: None, extra: Vec::new() };
+    let mut it = argv.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--local" => a.local = true,
+            "--cwd" => a.cwd = it.next().cloned(),
+            "--resume" => a.resume = it.next().cloned(),
+            "--" => {
+                a.extra = it.cloned().collect();
+                break;
+            }
+            "-h" | "--help" => agent_usage(),
+            s if kind.is_none() => kind = agent::proto::Kind::parse(s).or_else(|| agent_usage()),
+            s if host.is_none() && !s.starts_with('-') => host = Some(s.to_string()),
+            _ => agent_usage(),
+        }
+    }
+    a.kind = kind.unwrap_or_else(|| agent_usage());
+    match host {
+        Some(h) => a.host = h,
+        None if a.local => {}
+        None => agent_usage(),
+    }
+    a
+}
+
 fn main() {
+    let raw: Vec<String> = std::env::args().collect();
+    if raw.get(1).map(|s| s.as_str()) == Some("agent") {
+        let a = parse_agent_args(&raw[2..]);
+        if let Err(e) = agent::run(a) {
+            eprintln!("tns agent: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
     let args = parse_args();
     if let Some((c, r)) = args.dump {
         dump_screen(c, r);

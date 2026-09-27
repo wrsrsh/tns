@@ -1,6 +1,6 @@
 [package]
 name = "tns"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "predictive terminal for a remote fish shell"
 license = "MIT"
@@ -15,6 +15,10 @@ vte = "0.15"
 libc = "0.2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 unicode-width = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ratatui = "0.30"
+crossterm = "0.29"
 
 [profile.release]
 opt-level = 3
