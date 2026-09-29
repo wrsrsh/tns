@@ -302,6 +302,148 @@ fn poll_timeout_ms(now: Instant, deadlines: impl IntoIterator<Item = Instant>) -
     wait.as_nanos().div_ceil(1_000_000).min(500) as i32
 }
 
+/// Classify input without withholding or changing any bytes sent to the PTY.
+/// DA/DSR replies are not typing. An incomplete possible reply blocks taking
+/// an anchor until it is identified; other escapes remain keyboard input.
+#[derive(Default)]
+struct TerminalInput {
+    pending: Vec<u8>,
+    query: Vec<u8>,
+    cursor_reports: [u8; 2], // outstanding normal/private CPR queries
+}
+
+struct InputActivity {
+    user: bool,
+    protocol: bool, // do not learn/predict a reply or a fragmented sequence
+}
+
+impl TerminalInput {
+    fn output(&mut self, bytes: &[u8]) {
+        const QUERIES: [&[u8]; 2] = [b"\x1b[6n", b"\x1b[?6n"];
+        for &b in bytes {
+            if b == 0x1b {
+                self.query.clear();
+            } else if self.query.is_empty() {
+                continue;
+            }
+            self.query.push(b);
+            if let Some(i) = QUERIES.iter().position(|q| *q == self.query) {
+                self.cursor_reports[i] = self.cursor_reports[i].saturating_add(1);
+                self.query.clear();
+            } else if !QUERIES.iter().any(|q| q.starts_with(&self.query)) {
+                self.query.clear();
+            }
+        }
+    }
+
+    fn csi_reply(body: &[u8], cursor_reports: &mut [u8; 2]) -> bool {
+        let (&final_byte, params) = body.split_last().unwrap();
+        let numbers = |p: &[u8]| p.split(|&b| b == b';').all(|n| !n.is_empty() && n.iter().all(u8::is_ascii_digit));
+        match final_byte {
+            b'c' => matches!(params.first(), Some(b'?' | b'>')) && numbers(&params[1..]),
+            b'n' => matches!(params, b"0" | b"?0"),
+            b'R' => {
+                let private = usize::from(params.starts_with(b"?"));
+                let p = &params[private..];
+                // CPR has the same encoding as some modified function keys.
+                // Only recognize it when the terminal was actually queried.
+                if cursor_reports[private] > 0 && p.iter().filter(|&&b| b == b';').count() == 1 && numbers(p) {
+                    cursor_reports[private] -= 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn input(&mut self, bytes: &[u8]) -> InputActivity {
+        let mut activity = InputActivity { user: false, protocol: !self.pending.is_empty() };
+        for &b in bytes {
+            if self.pending.is_empty() && b != 0x1b {
+                activity.user = true;
+                continue;
+            }
+            self.pending.push(b);
+            if b"\x1b[".starts_with(&self.pending) {
+                continue;
+            }
+            if self.pending.starts_with(b"\x1b[") {
+                if (0x40..=0x7e).contains(&b) {
+                    if Self::csi_reply(&self.pending[2..], &mut self.cursor_reports) {
+                        activity.protocol = true;
+                    } else {
+                        activity.user = true;
+                    }
+                    self.pending.clear();
+                    continue;
+                }
+                if self.pending.len() <= 128 && (b.is_ascii_digit() || matches!(b, b';' | b'?' | b'>')) {
+                    continue;
+                }
+            }
+            activity.user = true;
+            self.pending.clear();
+        }
+        activity.protocol |= !self.pending.is_empty();
+        activity
+    }
+}
+
+/// Prompt events and mosh screen frames have no shared sequence number. Allow
+/// a recent pre-event screen from this command epoch, but give an early event
+/// time to catch up before using it. Arbitrarily delayed/reordered frames
+/// cannot be distinguished from command output without a protocol change.
+const PROMPT_EVENT_LOOKBACK: Duration = Duration::from_secs(1);
+const PROMPT_EVENT_GRACE: Duration = Duration::from_millis(350);
+
+struct PromptAnchor {
+    screen_after: Instant,
+    event: Option<(Instant, bool)>, // arrival time, whether screen order is known
+    pending: bool,
+    typed: bool,
+}
+
+impl PromptAnchor {
+    fn new(now: Instant, has_hooks: bool) -> Self {
+        Self { screen_after: now, event: if has_hooks { None } else { Some((now, true)) }, pending: true, typed: false }
+    }
+
+    fn prompt(&mut self, now: Instant, in_band: bool) {
+        self.event = Some((now, in_band));
+        // A delayed event must not turn the first key's echo into the anchor.
+        self.pending = !self.typed;
+    }
+
+    fn input(&mut self) {
+        self.typed = true;
+        self.pending = false;
+    }
+
+    fn resize(&mut self, now: Instant) {
+        self.screen_after = now;
+        self.event = self.event.map(|_| (now, true));
+        self.pending = self.event.is_some() && !self.typed;
+    }
+
+    fn deadline(&self, last_out: Option<Instant>, quiet: Duration) -> Option<Instant> {
+        if !self.pending || self.typed {
+            return None;
+        }
+        let (event_at, in_band) = self.event?;
+        let lo = last_out.filter(|lo| *lo >= self.screen_after)?;
+        if lo < event_at {
+            if in_band || event_at.duration_since(lo) > PROMPT_EVENT_LOOKBACK {
+                return None;
+            }
+            Some((lo + quiet).max(event_at + quiet.max(PROMPT_EVENT_GRACE)))
+        } else {
+            Some(lo + quiet)
+        }
+    }
+}
+
 struct Client {
     shared: Arc<Shared>,
     args: Args,
@@ -318,8 +460,8 @@ struct Client {
     overlay_cursor: bool, // the terminal cursor is where the prediction put it
     anchor: Anchor,
     anchor_valid: bool,
-    pending_anchor: bool,
-    prompt_t: Instant, // when the last prompt event arrived
+    prompt_anchor: PromptAnchor,
+    terminal_input: TerminalInput,
     last_out: Option<Instant>,
     rtt: f64,
     probes_started: bool,
@@ -451,8 +593,8 @@ impl Client {
             }
             match ev {
                 Event::Prompt => {
-                    self.pending_anchor = true;
-                    self.prompt_t = if in_band { self.last_out.unwrap_or_else(Instant::now) } else { Instant::now() };
+                    let now = if in_band { self.last_out.unwrap_or_else(Instant::now) } else { Instant::now() };
+                    self.prompt_anchor.prompt(now, in_band);
                     self.anchor_valid = false;
                     self.clear_prediction();
                     if !self.probes_started {
@@ -497,11 +639,11 @@ impl Client {
     }
 
     fn anchor_deadline(&self) -> Option<Instant> {
-        if !self.pending_anchor || self.sess.em.screen.alt || !self.sess.em.screen.grid.cells.iter().any(|c| *c != Grid::BLANK_CELL) {
+        if !self.prompt_anchor.pending || !self.terminal_input.pending.is_empty() || self.sess.em.screen.alt || !self.sess.em.screen.grid.cells.iter().any(|c| *c != Grid::BLANK_CELL) {
             return None;
         }
         let quiet = Duration::from_millis(if !self.shared.shell.has_hooks() { 250 } else if !self.args.ssh { 120 } else { 40 });
-        self.last_out.filter(|lo| *lo >= self.prompt_t).map(|lo| lo + quiet)
+        self.prompt_anchor.deadline(self.last_out, quiet)
     }
 
     fn inflight_deadline(&self) -> Option<Instant> {
@@ -524,7 +666,6 @@ impl Client {
             let timeout = poll_timeout_ms(now, self.inflight_deadline().into_iter().chain(self.anchor_deadline()));
             let wake = self.chan.as_ref().map_or(-1, |c| c.wake_fd);
             let ready = poll_read(&[0, self.sess.pty.fd, wake], timeout);
-            let now = Instant::now();
 
             if ready[2] {
                 if let Some(c) = &self.chan {
@@ -543,7 +684,7 @@ impl Client {
                 self.overlay.clear();
                 self.overlay_cursor = false;
                 self.anchor_valid = false;
-                self.pending_anchor = true;
+                self.prompt_anchor.resize(Instant::now());
             }
 
             if ready[1] {
@@ -552,8 +693,10 @@ impl Client {
                     break;
                 }
                 self.restore_overlay();
-                let Client { sess, buf, out, .. } = self;
+                let Client { sess, buf, out, terminal_input, .. } = self;
+                terminal_input.output(&buf[..n]);
                 sess.em.feed(&buf[..n], out);
+                let now = Instant::now();
                 self.last_out = Some(now);
                 if self.inflight.len() == 1 && !self.inflight[0].seen {
                     self.inflight[0].seen = true;
@@ -602,9 +745,13 @@ impl Client {
                     // Output processed earlier in this poll turn must not
                     // count as a response to input we have only just sent.
                     let now = Instant::now();
-                    self.shared.with_stats(|s| s.keys += 1);
+                    let activity = self.terminal_input.input(unit);
                     if matches!(unit, b"\r" | b"\n" | b"\x03" | b"\x04" | b"\x0c") {
+                        self.shared.with_stats(|s| s.keys += 1);
                         self.restore_overlay();
+                        // Never reuse output from before this command/reset
+                        // when its prompt event eventually arrives.
+                        self.prompt_anchor = PromptAnchor::new(now, self.shared.shell.has_hooks());
                         if !self.shared.shell.has_hooks() {
                             // no shell hooks: the command line on screen is the executed
                             // command, and the next quiet screen is the next prompt
@@ -612,8 +759,6 @@ impl Client {
                                 let cmd = self.anchor_row_text();
                                 self.shared.enqueue(&cmd, true);
                             }
-                            self.pending_anchor = true;
-                            self.prompt_t = Instant::now();
                             if !self.probes_started {
                                 self.probes_started = true;
                                 self.start_probes();
@@ -624,6 +769,13 @@ impl Client {
                         self.flush();
                         continue;
                     }
+                    if activity.user {
+                        self.prompt_anchor.input();
+                    }
+                    if activity.protocol {
+                        continue;
+                    }
+                    self.shared.with_stats(|s| s.keys += 1);
                     if !self.anchor_valid || self.sess.em.screen.alt {
                         continue;
                     }
@@ -663,12 +815,10 @@ impl Client {
 
             // ---- timers: quiescence
             let now = Instant::now();
-            // Over mosh the prompt event comes through a side channel and can
-            // beat the screen bytes, and mosh splits fish's prompt drawing
-            // across frames: wait for output after the event, a longer quiet
-            // window, and a screen that is not blank before taking the anchor.
+            // Both channel orders are possible. Wait for a settled candidate
+            // in the current epoch, and never capture a screen after typing.
             if self.anchor_deadline().is_some_and(|t| now >= t) {
-                self.pending_anchor = false;
+                self.prompt_anchor.pending = false;
                 let g = &self.sess.em.screen.grid;
                 self.anchor = (g.cy, g.cx);
                 self.anchor_valid = true;
@@ -857,8 +1007,8 @@ fn main() {
         overlay_cursor: false,
         anchor: (0, 0),
         anchor_valid: false,
-        pending_anchor: true,
-        prompt_t: Instant::now(),
+        prompt_anchor: PromptAnchor::new(Instant::now(), shell.has_hooks()),
+        terminal_input: TerminalInput::default(),
         last_out: None,
         rtt: 0.08,
         probes_started: false,
@@ -940,5 +1090,123 @@ mod client_regressions {
         let keys = VecDeque::from([key(t, true, None)]);
         // Expired *old* output cannot arm a zero-timeout response timer.
         assert_eq!(poll_timeout_ms(t, inflight_deadline(&keys, Some(t - Duration::from_secs(1)), 0.08)), 500);
+    }
+
+    #[test]
+    fn terminal_replies_survive_every_stdin_chunk_boundary() {
+        for reply in [b"\x1b[?62;22c".as_slice(), b"\x1b[>0;1;0c", b"\x1b[0n", b"\x1b[12;34R", b"\x1b[?12;34R"] {
+            for split in 0..=reply.len() {
+                let mut input = TerminalInput::default();
+                // The query itself may also span multiple output reads.
+                input.output(b"\x1b[");
+                input.output(b"6n\x1b[?");
+                input.output(b"6n");
+                let a = input.input(&reply[..split]);
+                let b = input.input(&reply[split..]);
+                assert!(!a.user && !b.user, "{reply:?} split at {split}");
+                assert!(a.protocol || b.protocol);
+                assert!(input.pending.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_escapes_and_reply_shaped_function_keys_are_user_input() {
+        for key in [b"\x1b[A".as_slice(), b"\x1b[1;2R", b"\x1bOR", b"\x1b[15~", b"\x1bx", b"\x1b]arbitrary\x07"] {
+            for split in 0..=key.len() {
+                let mut input = TerminalInput::default();
+                let a = input.input(&key[..split]);
+                let b = input.input(&key[split..]);
+                assert!(a.user || b.user, "{key:?} split at {split}");
+                assert!(input.pending.is_empty());
+            }
+        }
+        let mut input = TerminalInput::default();
+        input.output(b"\x1b[6n");
+        assert!(!input.input(b"\x1b[1;2R").user); // solicited CPR
+        assert!(input.input(b"\x1b[1;2R").user); // query already consumed
+    }
+
+    #[test]
+    fn partial_or_mixed_terminal_input_cannot_anchor_over_typing() {
+        let mut input = TerminalInput::default();
+        assert!(!input.input(b"\x1b[").user);
+        assert!(!input.pending.is_empty()); // blocks anchor until classified
+        assert!(input.input(b"A").user);
+        assert!(input.pending.is_empty());
+        let activity = input.input(b"\x1b[?62;22ca");
+        assert!(activity.user); // report + real typing in the same read
+        assert!(activity.protocol); // never learn the whole read as a key
+        assert!(input.pending.is_empty());
+    }
+
+    #[test]
+    fn prompt_event_before_screen_waits_for_quiet_output() {
+        let t = Instant::now();
+        let mut anchor = PromptAnchor::new(t, true);
+        let quiet = Duration::from_millis(120);
+        assert_eq!(anchor.deadline(Some(t), quiet), None); // hooks must arrive
+        anchor.prompt(t + Duration::from_millis(100), false);
+        assert_eq!(anchor.deadline(None, quiet), None);
+        assert_eq!(anchor.deadline(Some(t + Duration::from_millis(200)), quiet), Some(t + Duration::from_millis(320)));
+        // A second prompt frame restarts the quiet window.
+        assert_eq!(anchor.deadline(Some(t + Duration::from_millis(260)), quiet), Some(t + Duration::from_millis(380)));
+    }
+
+    #[test]
+    fn prompt_event_after_screen_uses_recent_candidate_with_grace() {
+        let t = Instant::now();
+        let mut anchor = PromptAnchor::new(t, true);
+        anchor.prompt(t + Duration::from_millis(500), false);
+        assert_eq!(anchor.deadline(Some(t + Duration::from_millis(10)), Duration::from_millis(120)), Some(t + Duration::from_millis(850)));
+        // If the event was actually early, new output replaces that fallback.
+        assert_eq!(anchor.deadline(Some(t + Duration::from_millis(600)), Duration::from_millis(120)), Some(t + Duration::from_millis(720)));
+    }
+
+    #[test]
+    fn prompt_does_not_reuse_old_command_output_or_spin() {
+        let t = Instant::now();
+        let mut anchor = PromptAnchor::new(t, true);
+        let quiet = Duration::from_millis(120);
+        anchor.prompt(t + Duration::from_millis(100), false);
+        // Even a recent screen from the previous command epoch is ineligible.
+        assert_eq!(anchor.deadline(Some(t - Duration::from_millis(10)), quiet), None);
+        anchor.prompt(t + Duration::from_secs(2), false);
+        // Old output within this epoch is not an unbounded fallback either.
+        let deadline = anchor.deadline(Some(t), quiet);
+        assert_eq!(deadline, None);
+        assert_eq!(poll_timeout_ms(t + Duration::from_secs(3), deadline), 500);
+    }
+
+    #[test]
+    fn typing_cancels_anchoring_even_when_event_arrives_later() {
+        let t = Instant::now();
+        for event_first in [true, false] {
+            let mut anchor = PromptAnchor::new(t, true);
+            if event_first {
+                anchor.prompt(t, false);
+            }
+            anchor.input();
+            if !event_first {
+                anchor.prompt(t + Duration::from_millis(100), false);
+            }
+            let deadline = anchor.deadline(Some(t + Duration::from_millis(200)), Duration::from_millis(120));
+            assert_eq!(deadline, None);
+            assert_eq!(poll_timeout_ms(t + Duration::from_secs(1), deadline), 500);
+            anchor.resize(t + Duration::from_millis(300));
+            assert_eq!(anchor.deadline(Some(t + Duration::from_millis(400)), Duration::from_millis(120)), None);
+        }
+    }
+
+    #[test]
+    fn in_band_and_hookless_prompts_keep_ordered_output_requirement() {
+        let t = Instant::now();
+        let mut anchor = PromptAnchor::new(t, true);
+        anchor.prompt(t + Duration::from_millis(100), true);
+        assert_eq!(anchor.deadline(Some(t), OUTPUT_QUIET), None);
+        assert_eq!(anchor.deadline(Some(t + Duration::from_millis(100)), OUTPUT_QUIET), Some(t + Duration::from_millis(140)));
+        let anchor = PromptAnchor::new(t, false);
+        assert_eq!(anchor.deadline(Some(t - Duration::from_millis(1)), Duration::from_millis(250)), None);
+        assert_eq!(anchor.deadline(Some(t), Duration::from_millis(250)), Some(t + Duration::from_millis(250)));
     }
 }
