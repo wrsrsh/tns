@@ -45,7 +45,38 @@ pub struct Emulator {
 
 /// Index at which an incomplete trailing escape sequence starts, or len.
 fn split_tail(data: &[u8]) -> usize {
-    let i = match data.iter().rposition(|&b| b == 0x1b) {
+    let mut last_escape = None;
+    let mut pos = 0;
+    while let Some(offset) = data[pos..].iter().position(|&b| b == 0x1b) {
+        let i = pos + offset;
+        last_escape = Some(i);
+        pos = i + 1;
+        if data.get(pos) != Some(&b']') {
+            continue;
+        }
+        // Walk OSCs from their opening ESC: the ESC in a split ST belongs to
+        // this OSC, not to a new trailing escape sequence.
+        let end = match data[i + 2..].iter().position(|&b| b == 0x07 || b == 0x1b) {
+            Some(offset) => i + 2 + offset,
+            None => return i,
+        };
+        if data[end] == 0x07 {
+            pos = end + 1;
+        } else {
+            match data.get(end + 1) {
+                Some(b'\\') => pos = end + 2,
+                None => return i,
+                // As in parse_osc, another escape cancels this OSC. Resume at
+                // that escape so incomplete CSI/charset sequences stay held.
+                Some(_) => {
+                    pos = end;
+                    continue;
+                }
+            }
+        }
+        last_escape = None;
+    }
+    let i = match last_escape {
         Some(i) => i,
         None => return data.len(),
     };
@@ -56,13 +87,6 @@ fn split_tail(data: &[u8]) -> usize {
     match tail[1] {
         b'[' => {
             if tail[2..].iter().any(|&b| (0x40..=0x7e).contains(&b)) {
-                data.len()
-            } else {
-                i
-            }
-        }
-        b']' => {
-            if tail.contains(&0x07) || tail[2..].windows(2).any(|w| w == b"\x1b\\") {
                 data.len()
             } else {
                 i
@@ -477,5 +501,90 @@ mod tests {
         em.feed(b"1mY", &mut out);
         assert_eq!(out, b"x\x1b[31mY");
         assert_eq!(em.screen.grid.row(0)[1].chr(), Some('Y'));
+    }
+
+    #[test]
+    fn osc_split_between_st_bytes_is_held() {
+        let mut em = Emulator::new(20, 2);
+        let mut out = Vec::new();
+        em.feed(b"a\x1b]7771;/tmp/x\x1b", &mut out);
+        assert_eq!(out, b"a");
+        assert!(em.events.is_empty());
+        em.feed(b"\\b", &mut out);
+        assert_eq!(out, b"ab");
+        assert_eq!(em.cwd.as_deref(), Some("/tmp/x"));
+        assert!(matches!(em.events.pop_front(), Some(Event::Cwd(s)) if s == "/tmp/x"));
+        assert!(em.events.is_empty());
+    }
+
+    #[test]
+    fn osc_events_survive_every_chunk_boundary() {
+        for (first, second) in [("\x07", "\x1b\\"), ("\x1b\\", "\x07")] {
+            let input = format!(
+                "a\x1b]7771;/tmp/x%20y{first}b\x1b[31mc\x1b]133;A{second}d\
+                 \x1b]0;title{first}e\x1b]7770;echo%20%C3%A9{second}f\
+                 \x1b(Bg\x1b7h\x1b[0mi\x1b]7771;/tmp/z{second}j"
+            );
+            let expected = format!("ab\x1b[31mc\x1b]133;A{second}d\x1b]0;title{first}ef\x1b(Bg\x1b7h\x1b[0mij");
+            let check = |chunks: &[&[u8]]| {
+                let mut em = Emulator::new(30, 2);
+                let mut out = Vec::new();
+                for chunk in chunks {
+                    em.feed(chunk, &mut out);
+                    assert!(expected.as_bytes().starts_with(&out), "marker leaked for chunks={chunks:?}");
+                }
+                assert_eq!(out, expected.as_bytes(), "chunks={chunks:?}");
+                assert!(em.carry.is_empty());
+                assert_eq!(em.cwd.as_deref(), Some("/tmp/z"));
+                assert!(matches!(em.events.pop_front(), Some(Event::Cwd(s)) if s == "/tmp/x y"));
+                assert!(matches!(em.events.pop_front(), Some(Event::Prompt)));
+                assert!(matches!(em.events.pop_front(), Some(Event::Exec(s)) if s == "echo é"));
+                assert!(matches!(em.events.pop_front(), Some(Event::Cwd(s)) if s == "/tmp/z"));
+                assert!(em.events.is_empty());
+            };
+            let bytes = input.as_bytes();
+            // Every two- and three-chunk split, including empty chunks, plus a
+            // maximally fragmented byte-at-a-time stream.
+            for a in 0..=bytes.len() {
+                for b in a..=bytes.len() {
+                    check(&[&bytes[..a], &bytes[a..b], &bytes[b..]]);
+                }
+            }
+            check(&bytes.chunks(1).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn incomplete_osc_cap_and_escape_resynchronization_are_preserved() {
+        let mut em = Emulator::new(20, 2);
+        let mut out = Vec::new();
+        let mut marker = b"\x1b]7771;".to_vec();
+        marker.resize(4095, b'x');
+        marker.push(0x1b);
+        em.feed(&marker, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(em.carry.len(), 4096);
+        em.feed(b"x", &mut out);
+        marker.push(b'x');
+        assert_eq!(out, marker);
+        assert!(em.carry.is_empty());
+        assert!(em.events.is_empty());
+
+        let mut em = Emulator::new(20, 2);
+        let mut out = Vec::new();
+        let mut unterminated = b"\x1b]7771;".to_vec();
+        unterminated.resize(4096, b'x');
+        em.feed(&unterminated, &mut out);
+        assert!(out.is_empty());
+        em.feed(b"x", &mut out);
+        unterminated.push(b'x');
+        assert_eq!(out, unterminated);
+        assert!(em.carry.is_empty());
+
+        // ESC followed by something other than backslash cancels the OSC.
+        assert_eq!(split_tail(b"a\x1b]7771;x\x1b[31"), b"a\x1b]7771;x".len());
+        assert_eq!(split_tail(b"a\x1b]7771;x\x1b[31m"), b"a\x1b]7771;x\x1b[31m".len());
+        assert_eq!(split_tail(b"a\x1b[31\x1b("), b"a\x1b[31".len());
+        assert_eq!(split_tail(b"a\x1b[31\x1b(B"), b"a\x1b[31\x1b(B".len());
     }
 }
