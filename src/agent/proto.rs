@@ -59,8 +59,8 @@ impl Kind {
 
 /// A stdio-speaking agent.
 pub trait Adapter: Send {
-    /// Command to run on the remote (cwd is handled by the caller).
-    fn argv(&self, resume: Option<&str>, extra: &[String]) -> Vec<String>;
+    /// Configure the session and return its command (cwd is handled by the caller).
+    fn argv(&mut self, resume: Option<&str>, extra: &[String]) -> Vec<String>;
     /// Lines to send right after start.
     fn on_start(&mut self) -> Vec<String> {
         Vec::new()
@@ -119,7 +119,7 @@ impl Claude {
 }
 
 impl Adapter for Claude {
-    fn argv(&self, resume: Option<&str>, extra: &[String]) -> Vec<String> {
+    fn argv(&mut self, resume: Option<&str>, extra: &[String]) -> Vec<String> {
         let mut v: Vec<String> = [
             "claude",
             "-p",
@@ -324,7 +324,9 @@ impl Codex {
 }
 
 impl Adapter for Codex {
-    fn argv(&self, _resume: Option<&str>, extra: &[String]) -> Vec<String> {
+    fn argv(&mut self, resume: Option<&str>, extra: &[String]) -> Vec<String> {
+        // app-server resumes through the handshake, not a CLI argument.
+        self.resume = resume.map(str::to_string);
         let mut v = vec!["codex".to_string(), "app-server".to_string()];
         v.extend(extra.iter().cloned());
         v
@@ -523,7 +525,7 @@ impl Adapter for Pi {
         vec![json!({"id":"tns-state","type":"get_state"}).to_string()]
     }
 
-    fn argv(&self, resume: Option<&str>, extra: &[String]) -> Vec<String> {
+    fn argv(&mut self, resume: Option<&str>, extra: &[String]) -> Vec<String> {
         let mut v = vec!["pi".to_string(), "--mode".into(), "rpc".into()];
         if let Some(id) = resume {
             v.push("--session".into());
@@ -751,6 +753,7 @@ mod tests {
     #[test]
     fn codex_handshake_and_deltas() {
         let mut c = Codex::new(Some("/w".into()));
+        c.argv(None, &[]);
         let mut out = Vec::new();
         let mut send = Vec::new();
         assert!(c.on_start()[0].contains("initialize"));
@@ -763,6 +766,26 @@ mod tests {
         c.on_line(r#"{"id":9,"method":"item/commandExecution/requestApproval","params":{"command":["rm","-rf","x"]}}"#, &mut out, &mut send);
         assert!(matches!(out.last(), Some(Ev::Permission { id, .. }) if id == "9"));
         assert_eq!(c.answer("9", Reply::Deny)[0], r#"{"id":9,"result":{"decision":"decline"}}"#);
+    }
+
+    #[test]
+    fn codex_resumes_on_initial_connect_and_reconnect() {
+        // Reconnection constructs a fresh adapter with the saved session ID.
+        for _ in 0..2 {
+            let mut c = Codex::new(None);
+            assert_eq!(c.argv(Some("saved-thread"), &[]), ["codex", "app-server"]);
+            c.on_start();
+            assert!(c.send_message("continue").is_empty());
+            let (mut out, mut send) = (Vec::new(), Vec::new());
+            c.on_line(r#"{"id":1,"result":{}}"#, &mut out, &mut send);
+            let request: Value = serde_json::from_str(&send[0]).unwrap();
+            assert_eq!(request["method"], "thread/resume");
+            assert_eq!(request["params"]["threadId"], "saved-thread");
+            c.on_line(r#"{"id":2,"result":{"thread":{"id":"saved-thread"}}}"#, &mut out, &mut send);
+            let turn: Value = serde_json::from_str(&send[1]).unwrap();
+            assert_eq!(turn["method"], "turn/start");
+            assert_eq!(turn["params"]["threadId"], "saved-thread");
+        }
     }
 
     #[test]
