@@ -177,10 +177,22 @@ fn run_script_body(dir: &str, shell: Shell, shell_path: &str) -> String {
         Shell::Fish => "exec fish -C \"source $d/init.fish\"".to_string(),
         Shell::Other => format!("exec {}", shell_path),
     };
+    // Convert encoded bytes to POSIX printf's octal escapes, not the nonportable
+    // \xHH form. The sentinel keeps command substitution from trimming newlines.
     format!(
         "#!/bin/sh\n\
          d={dir}/$1\n\
-         if [ -n \"$2\" ]; then c=$(printf '%b' \"$(printf '%s' \"$2\" | sed 's/%/\\\\x/g')\"); cd \"$c\" 2>/dev/null; fi\n\
+         if [ -n \"$2\" ]; then\n\
+           encoded=$2 c=\n\
+           while [ -n \"$encoded\" ]; do\n\
+             case $encoded in\n\
+               %??*) h=${{encoded#%}}; h=${{h%\"${{h#??}}\"}}; encoded=${{encoded#???}}; c=$c$(printf '\\\\0%03o' \"$((0x$h))\");;\n\
+               *) c=$c${{encoded%\"${{encoded#?}}\"}}; encoded=${{encoded#?}};;\n\
+             esac\n\
+           done\n\
+           c=$(printf '%b.' \"$c\"); c=${{c%.}}\n\
+           cd \"$c\" 2>/dev/null\n\
+         fi\n\
          {launch}\n"
     )
 }
@@ -295,6 +307,52 @@ pub fn history(host: &str, shell: Shell, limit: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("tns-encoding-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path.canonicalize().unwrap())
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn launch_decodes_cwd_in_posix_shells() {
+        let tmp = TestDir::new();
+        let script = tmp.0.join("run");
+        std::fs::write(&script, run_script_body("/tmp/tns-test", Shell::Other, "pwd")).unwrap();
+        for name in ["plain", "with spaces", "it's \"quoted\"", "100%literal%20", r"back\slash\c", "日本語-é-🦀", "trailing\n\n"] {
+            let cwd = tmp.0.join(name);
+            std::fs::create_dir(&cwd).unwrap();
+            let expected = format!("{}\n", cwd.display());
+            for shell in ["sh", "dash"] {
+                let output = Command::new(shell)
+                    .env_clear()
+                    .env("HOME", &tmp.0)
+                    .env("PATH", "/usr/bin:/bin")
+                    .current_dir(&tmp.0)
+                    .arg(&script)
+                    .arg("osc")
+                    .arg(url_encode(cwd.to_str().unwrap()))
+                    .output();
+                let output = match output {
+                    Err(e) if shell == "dash" && e.kind() == io::ErrorKind::NotFound => continue,
+                    output => output.unwrap(),
+                };
+                assert!(output.status.success(), "{shell}: {}", String::from_utf8_lossy(&output.stderr));
+                assert_eq!(output.stdout, expected.as_bytes(), "{shell}, cwd={cwd:?}");
+            }
+        }
+    }
 
     #[test]
     fn encoding_is_shell_safe() {
