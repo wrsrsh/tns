@@ -193,7 +193,12 @@ impl Screen {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        let dropped_rows = self.grid.rows.saturating_sub(rows);
         self.grid.resize(cols, rows);
+        // The primary grid stays frozen while an alternate-screen app runs,
+        // but its saved cursor must follow the same resize as that grid.
+        self.alt_cursor.0 = self.alt_cursor.0.min(cols);
+        self.alt_cursor.1 = self.alt_cursor.1.saturating_sub(dropped_rows).min(rows - 1);
         self.margins = None;
         self.dirty = true;
     }
@@ -764,6 +769,30 @@ mod tests {
         feed(&mut s, b"ab\x1b[?1049hzzz\x1b[2J\x1b[?1049lc");
         assert_eq!(text(&s.grid, 0), "abc");
         assert!(!s.alt);
+    }
+
+    #[test]
+    fn resize_in_alternate_screen_keeps_restored_cursor_in_bounds() {
+        for mode in [47, 1047, 1049] {
+            let mut s = Screen::new(80, 24);
+            feed(&mut s, format!("\x1b[24;70H\x1b[?{}h", mode).as_bytes());
+            s.resize(40, 10);
+            feed(&mut s, format!("\x1b[?{}l", mode).as_bytes());
+            assert_eq!((s.grid.cx, s.grid.cy), (40, 9));
+            feed(&mut s, b"X");
+            assert_eq!(s.grid.row(9)[0].chr(), Some('X'));
+        }
+    }
+
+    #[test]
+    fn alternate_cursor_follows_rows_dropped_on_resize() {
+        let mut s = Screen::new(80, 24);
+        feed(&mut s, b"\x1b[20;5H\x1b[?1049h");
+        s.resize(60, 20);
+        s.resize(40, 18);
+        feed(&mut s, b"\x1b[?1049lX");
+        assert_eq!((s.grid.cx, s.grid.cy), (5, 13));
+        assert_eq!(s.grid.row(13)[4].chr(), Some('X'));
     }
 
     #[test]
