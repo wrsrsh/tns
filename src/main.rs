@@ -277,6 +277,31 @@ impl Inflight {
     }
 }
 
+const OUTPUT_QUIET: Duration = Duration::from_millis(40);
+
+/// Output is not an acknowledgment of any particular key. Only a single key
+/// with its own snapshot can be learned after ordinary output quiescence.
+/// Ambiguous bursts (and failed predictions) get an RTT-sized grace period
+/// after the *last* key, then are discarded without learning a combined diff.
+fn inflight_deadline(inflight: &VecDeque<Inflight>, last_out: Option<Instant>, rtt: f64) -> Option<Instant> {
+    let first = inflight.front()?;
+    let last = inflight.back()?;
+    let lo = last_out.filter(|lo| *lo >= last.t)?;
+    let quiet = lo + OUTPUT_QUIET;
+    if inflight.len() == 1 && first.expected.is_none() && first.has_snap {
+        Some(quiet)
+    } else {
+        Some(quiet.max(last.t + Duration::from_secs_f64(0.35f64.max(3.0 * rtt))))
+    }
+}
+
+/// Round up sub-millisecond waits: truncating them to zero busy-polls until
+/// the deadline. Callers only supply timers whose expiry can change state.
+fn poll_timeout_ms(now: Instant, deadlines: impl IntoIterator<Item = Instant>) -> i32 {
+    let wait = deadlines.into_iter().map(|t| t.saturating_duration_since(now)).min().unwrap_or(Duration::from_millis(500));
+    wait.as_nanos().div_ceil(1_000_000).min(500) as i32
+}
+
 struct Client {
     shared: Arc<Shared>,
     args: Args,
@@ -471,6 +496,21 @@ impl Client {
         }
     }
 
+    fn anchor_deadline(&self) -> Option<Instant> {
+        if !self.pending_anchor || self.sess.em.screen.alt || !self.sess.em.screen.grid.cells.iter().any(|c| *c != Grid::BLANK_CELL) {
+            return None;
+        }
+        let quiet = Duration::from_millis(if !self.shared.shell.has_hooks() { 250 } else if !self.args.ssh { 120 } else { 40 });
+        self.last_out.filter(|lo| *lo >= self.prompt_t).map(|lo| lo + quiet)
+    }
+
+    fn inflight_deadline(&self) -> Option<Instant> {
+        if !self.anchor_valid || self.sess.em.screen.alt {
+            return None;
+        }
+        inflight_deadline(&self.inflight, self.last_out, self.rtt)
+    }
+
     fn run(&mut self) {
         unsafe {
             libc::signal(libc::SIGWINCH, on_winch as extern "C" fn(libc::c_int) as usize);
@@ -481,14 +521,9 @@ impl Client {
 
         loop {
             let now = Instant::now();
-            let mut timeout = Duration::from_millis(500);
-            if self.inflight.len() > 0 || self.pending_anchor {
-                if let Some(lo) = self.last_out {
-                    timeout = timeout.min((lo + Duration::from_millis(40)).saturating_duration_since(now));
-                }
-            }
+            let timeout = poll_timeout_ms(now, self.inflight_deadline().into_iter().chain(self.anchor_deadline()));
             let wake = self.chan.as_ref().map_or(-1, |c| c.wake_fd);
-            let ready = poll_read(&[0, self.sess.pty.fd, wake], timeout.as_millis() as i32);
+            let ready = poll_read(&[0, self.sess.pty.fd, wake], timeout);
             let now = Instant::now();
 
             if ready[2] {
@@ -564,6 +599,9 @@ impl Client {
                     if self.sess.pty.write(unit).is_err() {
                         break;
                     }
+                    // Output processed earlier in this poll turn must not
+                    // count as a response to input we have only just sent.
+                    let now = Instant::now();
                     self.shared.with_stats(|s| s.keys += 1);
                     if matches!(unit, b"\r" | b"\n" | b"\x03" | b"\x04" | b"\x0c") {
                         self.restore_overlay();
@@ -625,15 +663,11 @@ impl Client {
 
             // ---- timers: quiescence
             let now = Instant::now();
-            let quiet = self.last_out.map_or(false, |lo| now.duration_since(lo) >= Duration::from_millis(40));
             // Over mosh the prompt event comes through a side channel and can
             // beat the screen bytes, and mosh splits fish's prompt drawing
             // across frames: wait for output after the event, a longer quiet
             // window, and a screen that is not blank before taking the anchor.
-            let anchor_quiet = Duration::from_millis(if !self.shared.shell.has_hooks() { 250 } else if !self.args.ssh { 120 } else { 40 });
-            let anchor_ok = self.last_out.map_or(false, |lo| now.duration_since(lo) >= anchor_quiet && lo >= self.prompt_t)
-                && self.sess.em.screen.grid.cells.iter().any(|c| *c != Grid::BLANK_CELL);
-            if self.pending_anchor && anchor_ok && !self.sess.em.screen.alt {
+            if self.anchor_deadline().is_some_and(|t| now >= t) {
                 self.pending_anchor = false;
                 let g = &self.sess.em.screen.grid;
                 self.anchor = (g.cy, g.cx);
@@ -645,30 +679,20 @@ impl Client {
                     self.start_probes();
                 }
             }
-            if !self.inflight.is_empty() && quiet && self.anchor_valid {
-                let (expected, seen, has_snap, t, single) = {
-                    let e = &self.inflight[0];
-                    (e.expected, e.seen, e.has_snap, e.t, self.inflight.len() == 1)
-                };
-                if expected.is_none() {
-                    if single && has_snap && seen {
-                        let e = self.inflight.pop_front().unwrap();
-                        self.learn(&e);
-                        self.clear_prediction();
-                        self.rebuild_pred();
-                    }
-                } else if now.duration_since(t).as_secs_f64() > (0.35f64).max(3.0 * self.rtt) && seen {
-                    // predicted, but the confirmed screen never matched: misprediction
+            if self.inflight_deadline().is_some_and(|t| now >= t) {
+                let single = self.inflight.len() == 1;
+                let e = self.inflight.pop_front().unwrap();
+                if e.expected.is_some() {
+                    // Predicted, but the confirmed screen never matched.
                     self.shared.with_stats(|s| s.miss += 1);
-                    let e = self.inflight.pop_front().unwrap();
                     self.log(&format!("miss unit={:?}", e.unit_str()));
-                    if single && has_snap {
-                        self.learn(&e);
-                    }
-                    self.clear_prediction();
-                    self.restore_overlay();
-                    self.flush();
                 }
+                if single && e.has_snap {
+                    self.learn(&e);
+                }
+                self.clear_prediction();
+                self.restore_overlay();
+                self.flush();
             }
             if t_start.elapsed() > Duration::from_secs(5) && self.last_save.elapsed() > Duration::from_secs(15) {
                 self.last_save = Instant::now();
@@ -868,4 +892,53 @@ fn main() {
     );
     drop(cache);
     drop(client);
+}
+
+#[cfg(test)]
+mod client_regressions {
+    use super::*;
+
+    fn key(t: Instant, has_snap: bool, expected: Option<Key>) -> Inflight {
+        Inflight { unit: [b'a'; 8], ulen: 1, pre_key: 0, t, val: expected, expected, has_snap, seen: false }
+    }
+
+    #[test]
+    fn single_uncached_key_settles_after_output() {
+        let t = Instant::now();
+        let keys = VecDeque::from([key(t, true, None)]);
+        assert_eq!(inflight_deadline(&keys, None, 0.08), None);
+        assert_eq!(inflight_deadline(&keys, Some(t - Duration::from_millis(1)), 0.08), None);
+        assert_eq!(inflight_deadline(&keys, Some(t + Duration::from_millis(100)), 0.08), Some(t + Duration::from_millis(140)));
+    }
+
+    #[test]
+    fn burst_settles_without_per_key_seen_flags() {
+        let t = Instant::now();
+        let keys = VecDeque::from([key(t, true, None), key(t + Duration::from_millis(20), false, None)]);
+        assert_eq!(inflight_deadline(&keys, Some(t + Duration::from_millis(10)), 0.08), None);
+        assert_eq!(inflight_deadline(&keys, Some(t + Duration::from_millis(100)), 0.08), Some(t + Duration::from_millis(370)));
+        // More output extends quiescence, even after the grace period.
+        assert_eq!(inflight_deadline(&keys, Some(t + Duration::from_millis(360)), 0.08), Some(t + Duration::from_millis(400)));
+    }
+
+    #[test]
+    fn predicted_and_snapshotless_suffixes_get_ack_grace() {
+        let t = Instant::now();
+        for k in [key(t, true, Some(1)), key(t, false, None)] {
+            let keys = VecDeque::from([k]);
+            assert_eq!(inflight_deadline(&keys, Some(t + Duration::from_millis(100)), 0.2), Some(t + Duration::from_secs_f64(3.0 * 0.2)));
+        }
+    }
+
+    #[test]
+    fn poll_waits_for_actionable_deadlines_without_rounding_down() {
+        let t = Instant::now();
+        assert_eq!(poll_timeout_ms(t, []), 500);
+        assert_eq!(poll_timeout_ms(t, [t + Duration::from_micros(500)]), 1);
+        assert_eq!(poll_timeout_ms(t, [t + Duration::from_millis(310)]), 310);
+        assert_eq!(poll_timeout_ms(t, [t - Duration::from_millis(1)]), 0);
+        let keys = VecDeque::from([key(t, true, None)]);
+        // Expired *old* output cannot arm a zero-timeout response timer.
+        assert_eq!(poll_timeout_ms(t, inflight_deadline(&keys, Some(t - Duration::from_secs(1)), 0.08)), 500);
+    }
 }
