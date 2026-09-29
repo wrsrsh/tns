@@ -126,11 +126,11 @@ pub fn hooks(shell: Shell, sink: &Sink) -> String {
         Sink::Osc => "__tns_emit() { case \"$1\" in P) printf '\\033]133;A\\a';; X) printf '\\033]7770;%s\\a' \"$2\";; D) printf '\\033]7771;%s\\a' \"$2\";; esac; }".to_string(),
         Sink::File(p) => format!("__tns_emit() {{ printf '%s %s\\n' \"$1\" \"$2\" >> {}; }}", p),
     };
-    // url-encode with shell builtins only (bash/zsh substring syntax)
-    // Percent-encode using only syntax bash and zsh share: ${s:$i:1} slicing
-    // and $(printf '%%%02X' "'$c") for the hex (the leading quote makes printf
-    // use the byte's numeric value).  Avoids bash-only `printf -v` and `+=`.
-    let url_posix = "__tns_url() { local s=$1 out= c i=0 n; n=${#s}; while [ $i -lt $n ]; do c=${s:$i:1}; case $c in [a-zA-Z0-9/._-]) out=$out$c ;; *) out=$out$(printf '%%%02X' \"'$c\") ;; esac; i=$((i+1)); done; printf '%s' \"$out\"; }";
+    // A local C locale makes both slicing and character classes byte-oriented
+    // without changing the caller's locale or options. Some older bash printf
+    // builtins sign-extend high bytes, so retain only the final two hex digits.
+    // Use only builtins and substring syntax shared by bash and zsh.
+    let url_posix = "__tns_url() { local LC_ALL=C; local s=$1 out= c i=0 n; n=${#s}; while [ $i -lt $n ]; do c=${s:$i:1}; case $c in [a-zA-Z0-9/._-]) out=$out$c ;; *) c=$(printf '%02X' \"'$c\"); out=$out%${c: -2} ;; esac; i=$((i+1)); done; printf '%s' \"$out\"; }";
     match shell {
         Shell::Bash => format!(
             "[ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\n{emit}\n{url}\n\
@@ -350,6 +350,61 @@ mod tests {
                 };
                 assert!(output.status.success(), "{shell}: {}", String::from_utf8_lossy(&output.stderr));
                 assert_eq!(output.stdout, expected.as_bytes(), "{shell}, cwd={cwd:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hook_url_encodes_utf8_bytes_without_changing_shell_state() {
+        let tmp = TestDir::new();
+        let locales = Command::new("locale").arg("-a").output().unwrap();
+        assert!(locales.status.success());
+        let locales = String::from_utf8(locales.stdout).unwrap();
+        let locales: Vec<_> = locales.lines().filter(|s| s.to_ascii_lowercase().replace('-', "").contains("utf8")).take(2).collect();
+        if locales.is_empty() {
+            eprintln!("no UTF-8 locales installed; skipping shell encoding regression");
+            return;
+        }
+        for (shell, args) in [(Shell::Bash, vec!["--noprofile", "--norc"]), (Shell::Zsh, vec!["-f"])] {
+            // Exercise the generated helper, not the startup-file sourcing around it.
+            let hooks = hooks(shell, &Sink::Osc);
+            let helper = hooks.lines().find(|l| l.starts_with("__tns_url()")).unwrap();
+            let script = format!(
+                "{helper}\n\
+                 before_options=$(set +o); before_locale=$(locale); before_all=${{LC_ALL+x}}\n\
+                 __tns_url \"$1\"\n\
+                 [ \"$(set +o)\" = \"$before_options\" ] || exit 91\n\
+                 [ \"$(locale)\" = \"$before_locale\" ] || exit 92\n\
+                 [ \"${{LC_ALL+x}}\" = \"$before_all\" ] || exit 93\n"
+            );
+            for locale in &locales {
+                for set_lc_all in [false, true] {
+                    for input in ["", "/home/me/a-z_0.9", "/tmp/日本語/café 🦀", "printf '%s\\n' '日 é'; echo \"$x\" % \\", "e\u{301}\t©ÿΩ\n"] {
+                        let mut cmd = Command::new(shell.name());
+                        cmd.env_clear()
+                            .env("HOME", &tmp.0)
+                            .env("ZDOTDIR", &tmp.0)
+                            .env("PATH", "/usr/bin:/bin")
+                            .env("LANG", locale)
+                            .env("LC_CTYPE", locale)
+                            .current_dir(&tmp.0)
+                            .args(&args)
+                            .args(["-c", &script, "tns-encoding-test", input]);
+                        if set_lc_all {
+                            cmd.env("LC_ALL", locale);
+                        }
+                        let output = match cmd.output() {
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                                eprintln!("{} not installed; skipping shell encoding regression", shell.name());
+                                break;
+                            }
+                            output => output.unwrap(),
+                        };
+                        assert!(output.status.success(), "{shell:?}/{locale}: {}", String::from_utf8_lossy(&output.stderr));
+                        assert_eq!(output.stdout, url_encode(input).as_bytes(), "{shell:?}/{locale}, input={input:?}");
+                        assert_eq!(crate::session::url_unquote(&output.stdout), input);
+                    }
+                }
             }
         }
     }
