@@ -1,6 +1,6 @@
 [package]
 name = "tns"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "predictive terminal for a remote fish shell"
 license = "MIT"
