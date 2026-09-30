@@ -1,0 +1,20 @@
+{
+  "name": "tns-pi",
+  "version": "0.6.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "description": "Connect Pi's local interface to Claude Code and Codex over SSH",
+  "keywords": ["pi-package"],
+  "pi": { "extensions": ["./extensions/pi/index.ts"] },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test tests/pi-*.test.ts"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

@@ -61,6 +61,7 @@ impl Transcript {
 
     pub fn apply(&mut self, ev: Ev) {
         match ev {
+            Ev::ControlResult { .. } => {}
             Ev::SessionId(id) => self.session = Some(id),
             Ev::Status(s) => self.status = s,
             Ev::Thinking => {

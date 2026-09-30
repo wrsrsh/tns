@@ -1,129 +1,192 @@
 #!/bin/sh
-# tns installer.  Usage:
-#   curl -fsSL https://raw.githubusercontent.com/wrsrsh/tns/main/install.sh | sh
-#
-# Installs tns and mosh, then runs `tns setup` to get your first host ready.
-# Set TNS_INTERACTIVE=false to install without launching setup.
+# Explicit machine roles: sh install.sh local | remote [--check]
+# No keys, SSH configuration, services, firewall rules, or shell profiles are changed.
 set -eu
 
-REPO="wrsrsh/tns"
-TAP="wrsrsh/tap/tns"
+REPO=wrsrsh/tns
+TAP=wrsrsh/tap/tns
+TNS_VERSION=${TNS_VERSION:-0.6.0}
+ROLE=
+CHECK=false
 
-main() {
-  os=$(detect_os)
-  say_banner
-  case "$os" in
-  darwin) install_macos ;;
-  linux) install_linux ;;
-  esac
-  ensure_path
-  finish
+usage() {
+  cat <<'EOF'
+usage: sh install.sh local [--check]
+       sh install.sh remote [--check]
+
+local   Run on the computer you type on. Install tns and mosh.
+remote  Run on the server you connect to. Install mosh only; no tns or Rust.
+
+--check  Report requirements without installing or changing anything.
+--help   Show this help.
+
+SSH access, key authentication, UTF-8 locales, and firewall policy are configured
+separately. After installation, run `tns setup user@server` on the LOCAL machine.
+EOF
+}
+
+die() { printf '\nError: %s\n' "$*" >&2; exit 1; }
+has() { command -v "$1" >/dev/null 2>&1; }
+step() { printf '\n%s\n' "$*"; }
+run() {
+  printf '  $ %s\n' "$*"
+  "$@" || { status=$?; printf 'Command failed (exit %s): %s\n' "$status" "$*" >&2; exit "$status"; }
+}
+
+parse_args() {
+  for arg do
+    case "$arg" in
+      local|remote) [ -z "$ROLE" ] || { usage >&2; exit 2; }; ROLE=$arg ;;
+      --check) CHECK=true ;;
+      -h|--help) usage; exit 0 ;;
+      *) printf 'Unknown argument: %s\n\n' "$arg" >&2; usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$ROLE" ] || { printf 'Choose the machine you are preparing: local or remote.\n\n' >&2; usage >&2; exit 2; }
 }
 
 detect_os() {
   case "$(uname -s)" in
-  Linux*) echo linux ;;
-  Darwin*) echo darwin ;;
-  *)
-    echo "tns: unsupported OS: $(uname -s). Build from source: https://github.com/$REPO" >&2
-    exit 1
-    ;;
+    Darwin) OS=darwin ;;
+    Linux) OS=linux ;;
+    *) die 'Supported systems are macOS and Linux (including WSL). Nothing was installed.' ;;
   esac
-}
-
-has() { command -v "$1" >/dev/null 2>&1; }
-
-say() { printf '%s\n' "$*"; }
-step() { printf '\n\033[36m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
-
-say_banner() {
-  printf '\033[1m\033[36mtns\033[0m — a predictive, roaming terminal for a remote shell\n'
-}
-
-# ---------- macOS: Homebrew tap (pulls mosh + a rust build toolchain)
-install_macos() {
-  if has tns; then
-    step "tns is already installed ($(tns --version 2>/dev/null || echo present)); upgrading"
-    brew upgrade "$TAP" 2>/dev/null || true
-    return
-  fi
-  if ! has brew; then
-    step "Installing Homebrew (needed to build tns)"
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv)"
-  fi
-  step "Installing tns and mosh with Homebrew"
-  brew install "$TAP"
-}
-
-# ---------- Linux: mosh from the package manager, tns from source
-install_linux() {
-  pkg=$(detect_pkg)
-  if [ -n "$pkg" ] && ! has mosh; then
-    step "Installing mosh with $pkg"
-    run_pkg_install "$pkg" mosh || say "tns: could not install mosh automatically; install it yourself later"
-  fi
-  if ! has cargo; then
-    step "Installing the Rust toolchain (to build tns)"
-    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
-    # shellcheck disable=SC1090
-    . "$HOME/.cargo/env"
-  fi
-  step "Building and installing tns"
-  cargo install --git "https://github.com/$REPO" --locked
 }
 
 detect_pkg() {
-  for p in apt-get dnf yum pacman apk zypper; do
-    if has "$p"; then
-      echo "$p"
-      return
+  for p in brew apt-get dnf yum pacman apk zypper; do
+    if has "$p"; then printf '%s\n' "$p"; return; fi
+  done
+  printf '\n'
+}
+
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    run "$@"
+  elif has sudo; then
+    run sudo "$@"
+  else
+    die "Root access is needed to run: $*. Install the package as an administrator, then retry."
+  fi
+}
+
+install_mosh() {
+  pkg=$(detect_pkg)
+  step "Installing mosh on this $ROLE machine"
+  case "$pkg" in
+    brew) run brew install mosh ;;
+    apt-get) as_root apt-get update; as_root apt-get install -y mosh ;;
+    dnf|yum) as_root "$pkg" install -y mosh ;;
+    pacman) as_root pacman -S --needed --noconfirm mosh ;;
+    apk) as_root apk add mosh ;;
+    zypper) as_root zypper --non-interactive install mosh ;;
+    *) die 'No supported package manager found. Install mosh manually, then rerun this installer.' ;;
+  esac
+}
+
+has_utf8() {
+  locale -a 2>/dev/null | grep -Eiq 'utf[-_]?8'
+}
+
+check_local() {
+  missing=0
+  step 'Local machine: runtime requirements'
+  for tool in tns ssh mosh; do
+    if has "$tool"; then
+      printf '  [ok] %s: %s\n' "$tool" "$(command -v "$tool")"
+    else
+      printf '  [missing] %s\n' "$tool"
+      missing=1
     fi
   done
-  echo ""
+  if locale charmap 2>/dev/null | grep -Eiq 'utf[-_]?8'; then
+    printf '  [ok] active UTF-8 locale\n'
+  else
+    printf '  [missing] active UTF-8 locale; choose an installed locale (locale -a)\n'
+    missing=1
+  fi
+  printf '\nRemote machine: not checked.\n'
+  printf 'Next, from this LOCAL machine: tns setup user@server\n'
+  return "$missing"
 }
 
-run_pkg_install() {
-  pkg=$1
-  shift
-  sudo=""
-  [ "$(id -u)" -eq 0 ] || sudo="sudo"
-  case "$pkg" in
-  apt-get) $sudo apt-get update && $sudo apt-get install -y "$@" ;;
-  dnf) $sudo dnf install -y "$@" ;;
-  yum) $sudo yum install -y "$@" ;;
-  pacman) $sudo pacman -S --noconfirm "$@" ;;
-  apk) $sudo apk add "$@" ;;
-  zypper) $sudo zypper install -y "$@" ;;
-  esac
+check_remote() {
+  missing=0
+  step 'Remote machine: runtime requirements'
+  if has mosh-server; then
+    printf '  [ok] mosh-server: %s\n' "$(command -v mosh-server)"
+  else
+    printf '  [missing] mosh-server; install the mosh package on this machine\n'
+    missing=1
+  fi
+  if has_utf8; then
+    printf '  [ok] an installed UTF-8 locale is available\n'
+  else
+    printf '  [missing] UTF-8 locale\n'
+    printf '  On Debian/Ubuntu: sudo locale-gen en_US.UTF-8\n'
+    missing=1
+  fi
+  printf '  [info] SSH service, authentication, and UDP connectivity were not checked.\n'
+  printf '  [info] tns and Rust are not needed on this remote machine.\n'
+  printf '\nNext, on your LOCAL machine:\n  ssh user@server\n  tns setup user@server\n'
+  printf 'Install and sign in to tools such as Claude on the REMOTE machine, if you use them.\n'
+  return "$missing"
 }
 
-ensure_path() {
-  # cargo installs to ~/.cargo/bin; make sure it is reachable this session
-  case ":$PATH:" in
-  *":$HOME/.cargo/bin:"*) : ;;
-  *)
-    if [ -x "$HOME/.cargo/bin/tns" ]; then
-      export PATH="$HOME/.cargo/bin:$PATH"
-      say "Add this to your shell profile so tns is always on your PATH:"
-      say "  export PATH=\"\$HOME/.cargo/bin:\$PATH\""
+install_local() {
+  if has brew; then
+    step 'Installing the local client with Homebrew (includes mosh)'
+    if brew list --versions "$TAP" >/dev/null 2>&1; then
+      run brew upgrade "$TAP"
+    else
+      run brew install "$TAP"
     fi
-    ;;
-  esac
+    tns_bin="$(brew --prefix)/bin/tns"
+  else
+    [ "$OS" = linux ] || die 'Install Homebrew from https://brew.sh, then rerun: sh install.sh local'
+    has cargo || die 'A Rust toolchain is required for the Linux source build. Install it from https://rustup.rs, then retry. No toolchain was installed automatically.'
+    has cc || die 'A C compiler/linker (cc) is required. On Debian/Ubuntu: sudo apt-get install build-essential'
+    has ssh || die 'Install an SSH client first. On Debian/Ubuntu: sudo apt-get install openssh-client'
+    printf '%s\n' "$TNS_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || die 'TNS_VERSION must be a release version such as 0.6.0'
+    has mosh || install_mosh
+    root=${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}
+    step "Building the local client from release v$TNS_VERSION"
+    run cargo install --git "https://github.com/$REPO" --tag "v$TNS_VERSION" --locked --root "$root"
+    tns_bin="$root/bin/tns"
+  fi
+  [ -x "$tns_bin" ] || die "Installation did not produce an executable at $tns_bin"
+  version=$("$tns_bin" --version) || die 'The installed tns executable could not run'
+  step "Installed: $version"
+  printf '  Location: %s\n' "$tns_bin"
+  resolved=$(command -v tns 2>/dev/null || true)
+  if [ -z "$resolved" ] || ! [ "$resolved" -ef "$tns_bin" ]; then
+    printf '\nYour shell does not resolve tns to this installation.\n'
+    printf 'For bash/zsh, run: export PATH="%s:$PATH"\n' "$(dirname "$tns_bin")"
+    printf 'For fish, run: fish_add_path "%s"\n' "$(dirname "$tns_bin")"
+    printf 'Then run: tns setup user@server\n'
+    exit 1
+  fi
+  check_local
 }
 
-finish() {
-  if ! has tns; then
-    say "tns: install finished but 'tns' is not on your PATH yet; open a new shell and try 'tns setup'."
+main() {
+  parse_args "$@"
+  detect_os
+  printf 'tns installation\n================\nTarget: %s machine (this computer).\n' "$ROLE"
+  printf 'No SSH keys, service configuration, firewall rules, or shell profiles will be changed.\n'
+  if [ "$CHECK" = true ]; then
+    printf 'Check only: no packages will be installed.\n'
+    case "$ROLE" in local) check_local ;; remote) check_remote ;; esac
     return
   fi
-  step "Installed: $(tns --version)"
-  if [ "${TNS_INTERACTIVE:-}" = "false" ] || [ ! -t 0 ]; then
-    say "Next: run 'tns setup' to connect your first host."
-    return
-  fi
-  say "Launching setup..."
-  tns setup </dev/tty
+  case "$ROLE" in
+    local) install_local ;;
+    remote)
+      step 'Preparing the remote machine: mosh only'
+      has mosh-server || install_mosh
+      check_remote
+      ;;
+  esac
 }
 
 main "$@"

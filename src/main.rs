@@ -57,8 +57,8 @@ fn usage_exit(code: i32) -> ! {
          \x20      tns --dump-screen COLSxROWS < bytes   (emulator test mode)\n\
          \x20      tns --bench CAPTURE.bin               (micro benchmarks)\n\
          \x20      tns agent <claude|codex|pi|opencode> HOST   (local UI for a remote agent, see tns agent --help)\n\
-         \x20      tns setup [HOST]                     (interactive: keys, mosh install, ssh config)\n\n\
-         predictive terminal for a remote fish shell\n\n\
+         \x20      tns setup [--local] [--ssh] [HOST]   (read-only local and remote setup checks)\n\n\
+         predictive terminal for remote shells and existing tools\n\n\
          --probes N          hidden calibration sessions (default 6)\n\
          --calib-seconds S   burst calibration time; afterwards one probe keeps learning (default 12)\n\
          --history N         how many recent history entries to learn (default 400)\n\
@@ -898,10 +898,11 @@ fn agent_usage() -> ! {
     eprintln!(
         "usage: tns agent <claude|codex|pi|opencode> HOST [--cwd DIR] [--resume ID] [-- AGENT_ARGS...]\n\
          \x20      tns agent <agent> --local [...]        run the agent on this machine\n\n\
-         Runs the agent headless on HOST and renders it here: the input box, scrolling and\n\
-         permission prompts are local, only your messages and interrupts cross the wire.\n\n\
-         keys: Enter send · alt-Enter newline · Esc interrupt · y/a/n answer a permission prompt\n\
-         \x20     PageUp/PageDown scroll · ctrl-r reconnect · ctrl-c twice or ctrl-d quit"
+         Claude and Codex use Pi locally, connected to the remote agent over SSH.\n\
+         Install Pi, then add this extension: pi install /path/to/tns\n\
+         --bridge     JSON-lines transport for the Pi extension\n\
+         --legacy-ui  use the original TNS interface\n\
+         Pi and OpenCode backends retain the original interface."
     );
     std::process::exit(2)
 }
@@ -914,8 +915,8 @@ fn parse_agent_args(argv: &[String]) -> agent::AgentArgs {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--local" => a.local = true,
-            "--cwd" => a.cwd = it.next().cloned(),
-            "--resume" => a.resume = it.next().cloned(),
+            "--cwd" => a.cwd = Some(it.next().cloned().unwrap_or_else(|| agent_usage())),
+            "--resume" => a.resume = Some(it.next().cloned().unwrap_or_else(|| agent_usage())),
             "--" => {
                 a.extra = it.cloned().collect();
                 break;
@@ -928,7 +929,8 @@ fn parse_agent_args(argv: &[String]) -> agent::AgentArgs {
     }
     a.kind = kind.unwrap_or_else(|| agent_usage());
     match host {
-        Some(h) => a.host = h,
+        Some(h) if !a.local && !h.starts_with('-') => a.host = h,
+        Some(_) => agent_usage(),
         None if a.local => {}
         None => agent_usage(),
     }
@@ -938,20 +940,34 @@ fn parse_agent_args(argv: &[String]) -> agent::AgentArgs {
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
     if raw.get(1).map(|s| s.as_str()) == Some("agent") {
-        let a = parse_agent_args(&raw[2..]);
-        if let Err(e) = agent::run(a) {
+        let mut bridge = false;
+        let mut legacy = false;
+        let mut extra = false;
+        let argv: Vec<String> = raw[2..].iter().filter(|s| {
+            if s.as_str() == "--" { extra = true; }
+            if !extra && s.as_str() == "--bridge" { bridge = true; false }
+            else if !extra && s.as_str() == "--legacy-ui" { legacy = true; false }
+            else { true }
+        }).cloned().collect();
+        let a = parse_agent_args(&argv);
+        let result = if bridge { agent::bridge::run(a) }
+            else if !legacy && matches!(a.kind, agent::proto::Kind::Claude | agent::proto::Kind::Codex) { agent::bridge::launch_pi(a) }
+            else { agent::run(a) };
+        if let Err(e) = result {
             eprintln!("tns agent: {}", e);
             std::process::exit(1);
         }
         return;
     }
     if raw.get(1).map(|s| s.as_str()) == Some("setup") {
-        let host = raw.get(2).filter(|s| !s.starts_with('-')).cloned();
-        if let Err(e) = setup::run(host) {
-            eprintln!("tns setup: {}", e);
-            std::process::exit(1);
-        }
-        return;
+        let code = match setup::run(&raw[2..]) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("tns setup: {}", e);
+                1
+            }
+        };
+        std::process::exit(code);
     }
     let args = parse_args();
     if let Some((c, r)) = args.dump {
@@ -994,7 +1010,7 @@ fn main() {
         }
     };
     if transport == Transport::Mosh && !info.mosh_server {
-        eprintln!("tns: mosh-server is not installed on {}. Run `tns setup {}` to install it, or use `tns --ssh {}`.", args.host, args.host, args.host);
+        eprintln!("tns: mosh-server is not installed on {}. Run `tns setup {}` for installation instructions, or use `tns --ssh {}`.", args.host, args.host, args.host);
         remote::cleanup(&args.host, &session_id);
         std::process::exit(1);
     }

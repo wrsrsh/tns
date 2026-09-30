@@ -1,0 +1,13 @@
+#!/bin/sh
+# Developer setup only. User installation is documented in docs/setup.md.
+set -eu
+cd "$(dirname "$0")/.."
+command -v cargo >/dev/null 2>&1 || { echo 'Install Rust (https://rustup.rs) and rerun bin/setup.' >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo 'Install Python 3 and rerun bin/setup.' >&2; exit 1; }
+if [ ! -x .venv/bin/python ]; then
+  [ ! -e .venv ] || { echo '.venv already exists but is not a usable virtual environment; inspect it before retrying.' >&2; exit 1; }
+  python3 -m venv .venv
+fi
+.venv/bin/python -m pip install -r tests/requirements.txt
+cargo build --locked
+printf '\nDevelopment environment prepared.\nRun tests: bin/check\nTry the client: ./target/debug/tns setup --local\n'

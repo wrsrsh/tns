@@ -1,8 +1,8 @@
 [package]
 name = "tns"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
-description = "predictive terminal for a remote fish shell"
+description = "Remote terminal with local typing prediction over SSH or mosh"
 license = "MIT"
 repository = "https://github.com/wrsrsh/tns"
 

@@ -6,6 +6,7 @@
 
 pub mod proto;
 pub mod ui;
+pub mod bridge;
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -31,6 +32,8 @@ enum Msg {
     Line(String),
     Stderr(String),
     Exit(String),
+    Input(String),
+    InputClosed,
 }
 
 fn ssh_base(host: &str) -> Vec<String> {
@@ -39,6 +42,21 @@ fn ssh_base(host: &str) -> Vec<String> {
 
 fn cwd_ok(c: &str) -> bool {
     c.chars().all(|ch| ch.is_ascii_alphanumeric() || "/._~-".contains(ch))
+}
+
+fn shell_quote(s: &str) -> String {
+    // Fish interprets backslashes even inside single quotes. Keep both backslashes
+    // and apostrophes in double-quoted segments, portable to bash, zsh and fish.
+    let mut quoted = String::from("'");
+    for ch in s.chars() {
+        match ch {
+            '\'' => quoted.push_str("'\"'\"'"),
+            '\\' => quoted.push_str("'\"\\\\\"'"),
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Spawn `argv` locally or on the host, with line readers feeding `tx`.
@@ -54,13 +72,10 @@ fn spawn(args: &AgentArgs, argv: Vec<String>, tx: Sender<Msg>) -> io::Result<(Ch
         let base = ssh_base(&args.host);
         cmd = Command::new(&base[0]);
         cmd.args(&base[1..]);
-        if let Some(c) = &args.cwd {
-            if !cwd_ok(c) {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "cwd may only contain letters, digits and /._~-"));
-            }
-            cmd.args(["cd", c, "&&", "exec"]);
-        }
-        cmd.args(&argv);
+        // SSH joins its arguments into a shell command: quote each value, including
+        // model arguments and paths with spaces, rather than passing them raw.
+        let prefix = args.cwd.as_ref().map(|c| format!("cd -- {} && ", shell_quote(c))).unwrap_or_default();
+        cmd.arg(format!("{}exec {}", prefix, argv.iter().map(|s| shell_quote(s)).collect::<Vec<_>>().join(" ")));
     }
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
@@ -97,6 +112,10 @@ trait Link {
     fn interrupt(&mut self) -> io::Result<()>;
     fn answer(&mut self, id: &str, r: Reply) -> io::Result<()>;
     fn close(&mut self);
+    fn control(&mut self, id: &str, _action: &str, _value: serde_json::Value, out: &mut Vec<Ev>) -> io::Result<()> {
+        out.push(Ev::ControlResult { id: id.into(), result: serde_json::Value::Null, error: Some("controls unavailable for this transport".into()) });
+        Ok(())
+    }
 }
 
 struct StdioLink {
@@ -116,6 +135,10 @@ impl StdioLink {
 }
 
 impl Link for StdioLink {
+    fn control(&mut self, id: &str, action: &str, value: serde_json::Value, out: &mut Vec<Ev>) -> io::Result<()> {
+        let lines = self.adapter.control(id, action, value, out);
+        self.write(lines)
+    }
     fn handle(&mut self, line: &str, out: &mut Vec<Ev>) {
         let mut send = Vec::new();
         self.adapter.on_line(line, out, &mut send);
@@ -374,6 +397,7 @@ pub fn run(args: AgentArgs) -> io::Result<()> {
                             view.transcript.status = "disconnected · ctrl-r: reconnect".into();
                         }
                     }
+                    Msg::Input(_) | Msg::InputClosed => {}
                 }
             }
             if !event::poll(Duration::from_millis(50))? {
@@ -495,4 +519,52 @@ pub fn run(args: AgentArgs) -> io::Result<()> {
         println!("session {}  (resume with: {} --resume {})", s, hint, s);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quote_roundtrip(shell: &str, flags: &[&str]) {
+        let values = [
+            "", "plain", "/path/with spaces/", "雪/é/e\u{301}/🦀", "'", "\"", "\\",
+            "\\\\", "\\'", "'\\", "ends in\\", "line one\nline two\n", "\\\n'\n\\",
+            "/cwd/with\\backslash'quote", "$HOME ${HOME}", "$(printf INJECTED)",
+            "(printf INJECTED)", "`printf INJECTED`", "'; printf INJECTED; #",
+            "\"; printf INJECTED; #", "* ? [a-z] {a,b} ~ % ; & | < > # !",
+            "--leading-dash", "tab\tcarriage\rreturn", "\\\"$`'\n/雪\\'",
+        ];
+        let command = format!(
+            "exec {} {} {}",
+            shell_quote("printf"),
+            shell_quote("%s\\0"),
+            values.iter().map(|s| shell_quote(s)).collect::<Vec<_>>().join(" "),
+        );
+        let output = match Command::new(shell).args(flags).arg("-c").arg(&command).output() {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                eprintln!("skipping {shell}: shell not installed");
+                return;
+            }
+            result => result.unwrap(),
+        };
+        assert!(output.status.success(), "{shell}: {}", String::from_utf8_lossy(&output.stderr));
+        let expected: Vec<u8> = values.iter().flat_map(|s| s.bytes().chain(std::iter::once(0))).collect();
+        assert_eq!(output.stdout, expected, "{shell}: argument bytes changed");
+        assert!(output.stderr.is_empty(), "{shell}: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn shell_quote_roundtrip_bash() {
+        quote_roundtrip("bash", &["--noprofile", "--norc"]);
+    }
+
+    #[test]
+    fn shell_quote_roundtrip_zsh() {
+        quote_roundtrip("zsh", &["-f"]);
+    }
+
+    #[test]
+    fn shell_quote_roundtrip_fish() {
+        quote_roundtrip("fish", &["--no-config"]);
+    }
 }

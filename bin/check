@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+if [ -z "${PYTHON:-}" ]; then
+  if [ -x .venv/bin/python ]; then PYTHON=.venv/bin/python; else PYTHON=python3; fi
+fi
+"$PYTHON" -c 'import pyte' 2>/dev/null || { echo 'Python test dependencies are missing. Run bin/setup first.' >&2; exit 1; }
+sh -n install.sh bin/setup bin/check
+cargo test --locked
+cargo build --locked
+TNS_BIN=${TNS_BIN:-"$PWD/target/debug/tns"}
+export TNS_BIN
+"$PYTHON" tests/setup_regressions.py
+"$PYTHON" tests/install_regressions.py
+"$PYTHON" tests/client_regressions.py
+"$PYTHON" tests/tui_prediction.py

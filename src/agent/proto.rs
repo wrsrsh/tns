@@ -8,7 +8,8 @@
 
 use serde_json::{json, Value};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Ev {
     SessionId(String),
     Status(String),
@@ -20,6 +21,7 @@ pub enum Ev {
     Permission { id: String, title: String, detail: String },
     TurnDone(Option<String>),
     Error(String),
+    ControlResult { id: String, result: Value, error: Option<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +71,10 @@ pub trait Adapter: Send {
     fn send_message(&mut self, text: &str) -> Vec<String>;
     fn interrupt(&mut self) -> Vec<String>;
     fn answer(&mut self, id: &str, reply: Reply) -> Vec<String>;
+    fn control(&mut self, id: &str, _action: &str, _value: Value, out: &mut Vec<Ev>) -> Vec<String> {
+        out.push(Ev::ControlResult { id: id.into(), result: Value::Null, error: Some("control not supported by this agent".into()) });
+        Vec::new()
+    }
 }
 
 fn compact(v: &Value, max: usize) -> String {
@@ -105,12 +111,14 @@ pub struct Claude {
     req: u64,
     blocks: Vec<(String, String)>, // index -> (type, tool_use_id)
     streamed_text: bool,
+    turn_has_text: bool,
     prompts: std::collections::HashMap<String, (Value, Value)>, // request id -> (input, permission_suggestions)
+    controls: std::collections::HashMap<String, (String, String)>,
 }
 
 impl Claude {
     pub fn new() -> Claude {
-        Claude { req: 0, blocks: Vec::new(), streamed_text: false, prompts: Default::default() }
+        Claude { req: 0, blocks: Vec::new(), streamed_text: false, turn_has_text: false, prompts: Default::default(), controls: Default::default() }
     }
     fn next_req(&mut self) -> String {
         self.req += 1;
@@ -149,6 +157,20 @@ impl Adapter for Claude {
             Err(_) => return,
         };
         let t = v["type"].as_str().unwrap_or("");
+        if t == "control_response" {
+            let response = &v["response"];
+            if let Some((id, action)) = self.controls.remove(response["request_id"].as_str().unwrap_or("")) {
+                let data = &response["response"];
+                let result = match action.as_str() {
+                    "models" => data["models"].clone(),
+                    "commands" => data["commands"].clone(),
+                    _ => data.clone(),
+                };
+                let error = (response["subtype"] == "error").then(|| response["error"].as_str().unwrap_or("agent rejected control request").to_string());
+                out.push(Ev::ControlResult { id, result, error });
+            }
+            return;
+        }
         match t {
             "system" => {
                 if v["subtype"] == "init" {
@@ -187,6 +209,7 @@ impl Adapter for Claude {
                         if d["type"] == "text_delta" {
                             if let Some(s) = d["text"].as_str() {
                                 self.streamed_text = true;
+                                self.turn_has_text = true;
                                 out.push(Ev::TextDelta(s.to_string()));
                             }
                         }
@@ -211,6 +234,7 @@ impl Adapter for Claude {
                             }),
                             "text" if !self.streamed_text => {
                                 if let Some(s) = c["text"].as_str() {
+                                    self.turn_has_text = true;
                                     out.push(Ev::TextDelta(s.to_string()));
                                     out.push(Ev::TextDone);
                                 }
@@ -238,6 +262,13 @@ impl Adapter for Claude {
                 }
             }
             "result" => {
+                // Headless slash commands can return their output only in result.
+                if !self.turn_has_text && !v["is_error"].as_bool().unwrap_or(false) {
+                    if let Some(text) = v["result"].as_str().filter(|s| !s.is_empty()) {
+                        out.push(Ev::TextDelta(text.into()));
+                        out.push(Ev::TextDone);
+                    }
+                }
                 let mut note = Vec::new();
                 if let Some(c) = v["total_cost_usd"].as_f64() {
                     note.push(format!("${:.3}", c));
@@ -268,7 +299,22 @@ impl Adapter for Claude {
         }
     }
 
+    fn control(&mut self, id: &str, action: &str, value: Value, out: &mut Vec<Ev>) -> Vec<String> {
+        let request = match action {
+            "models" | "commands" => json!({"subtype":"initialize"}),
+            "model" if value.as_str().is_some_and(|s| !s.is_empty()) => json!({"subtype":"set_model","model":value}),
+            _ => {
+                out.push(Ev::ControlResult { id: id.into(), result: Value::Null, error: Some("unsupported Claude control".into()) });
+                return Vec::new();
+            }
+        };
+        let wire_id = self.next_req();
+        self.controls.insert(wire_id.clone(), (id.into(), action.into()));
+        vec![json!({"type":"control_request","request_id":wire_id,"request":request}).to_string()]
+    }
+
     fn send_message(&mut self, text: &str) -> Vec<String> {
+        self.turn_has_text = false;
         vec![json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":text}]}}).to_string()]
     }
 
@@ -305,11 +351,14 @@ pub struct Codex {
     queued: Vec<String>,
     turn_req: Option<u64>,
     legacy_approval: std::collections::HashMap<String, bool>, // request id -> uses approved/denied words
+    model: Option<String>,
+    controls: std::collections::HashMap<u64, String>,
+    queued_controls: Vec<(String, String, Value)>,
 }
 
 impl Codex {
     pub fn new(cwd: Option<String>) -> Codex {
-        Codex { next_id: 0, thread: None, turn: None, resume: None, cwd, queued: Vec::new(), turn_req: None, legacy_approval: Default::default() }
+        Codex { next_id: 0, thread: None, turn: None, resume: None, cwd, queued: Vec::new(), turn_req: None, legacy_approval: Default::default(), model: None, controls: Default::default(), queued_controls: Vec::new() }
     }
     fn req(&mut self, method: &str, params: Value) -> (u64, String) {
         self.next_id += 1;
@@ -317,7 +366,12 @@ impl Codex {
     }
     fn start_turn(&mut self, text: &str) -> String {
         let thread = self.thread.clone().unwrap_or_default();
-        let (id, line) = self.req("turn/start", json!({"threadId": thread, "input": [{"type":"text","text":text}]}));
+        if text == "/compact" {
+            return self.req("thread/compact/start", json!({"threadId":thread})).1;
+        }
+        let mut params = json!({"threadId": thread, "input": [{"type":"text","text":text}]});
+        if let Some(model) = &self.model { params["model"] = json!(model); }
+        let (id, line) = self.req("turn/start", params);
         self.turn_req = Some(id);
         line
     }
@@ -344,6 +398,10 @@ impl Adapter for Codex {
         };
         // responses to our requests
         if let (Some(id), true) = (v["id"].as_u64(), v.get("method").is_none()) {
+            if let Some(client_id) = self.controls.remove(&id) {
+                out.push(Ev::ControlResult { id: client_id, result: v["result"].clone(), error: v.get("error").map(|e| e["message"].as_str().unwrap_or("agent rejected control request").to_string()) });
+                return;
+            }
             if let Some(err) = v.get("error") {
                 out.push(Ev::Error(compact(&err["message"], 300)));
                 return;
@@ -365,6 +423,9 @@ impl Adapter for Codex {
                     self.thread = Some(t.to_string());
                     out.push(Ev::SessionId(t.to_string()));
                     out.push(Ev::Status("ready".into()));
+                    for (id, action, value) in std::mem::take(&mut self.queued_controls) {
+                        send.extend(self.control(&id, &action, value, out));
+                    }
                     for q in std::mem::take(&mut self.queued) {
                         let l = self.start_turn(&q);
                         send.push(l);
@@ -416,6 +477,9 @@ impl Adapter for Codex {
             return;
         }
         match method {
+            "turn/started" => {
+                self.turn = p["turn"]["id"].as_str().map(str::to_string);
+            }
             "item/agentMessage/delta" => {
                 if let Some(d) = p["delta"].as_str() {
                     out.push(Ev::TextDelta(d.to_string()));
@@ -467,6 +531,9 @@ impl Adapter for Codex {
             }
             "turn/completed" => {
                 self.turn = None;
+                if p["turn"]["status"] == "failed" {
+                    out.push(Ev::Error(p["turn"]["error"]["message"].as_str().unwrap_or("remote turn failed").into()));
+                }
                 out.push(Ev::TurnDone(None));
             }
             "thread/tokenUsage/updated" => {
@@ -476,6 +543,29 @@ impl Adapter for Codex {
             }
             "error" => out.push(Ev::Error(compact(&p["message"], 300))),
             _ => {}
+        }
+    }
+
+    fn control(&mut self, id: &str, action: &str, value: Value, out: &mut Vec<Ev>) -> Vec<String> {
+        if self.thread.is_none() {
+            self.queued_controls.push((id.into(), action.into(), value));
+            return Vec::new();
+        }
+        match action {
+            "model" if value.as_str().is_some_and(|s| !s.is_empty()) => {
+                self.model = value.as_str().map(str::to_string);
+                out.push(Ev::ControlResult { id: id.into(), result: json!({"model":self.model,"applies":"next turn"}), error: None });
+                Vec::new()
+            }
+            "models" => {
+                let (wire_id, line) = self.req("model/list", json!({"cursor":value.as_str(),"limit":100}));
+                self.controls.insert(wire_id, id.into());
+                vec![line]
+            }
+            _ => {
+                out.push(Ev::ControlResult { id: id.into(), result: Value::Null, error: Some("unsupported Codex control; use /tns native for native slash commands".into()) });
+                Vec::new()
+            }
         }
     }
 
