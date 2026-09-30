@@ -82,6 +82,32 @@ tns starts your login shell by default and adapts how it tracks the prompt:
 Hooks are uploaded to a per-session directory under `/tmp/tns-<id>` on the
 remote and removed on exit; they never touch your dotfiles.
 
+### Claude's existing TUI, inside a normal session
+
+```sh
+tns HOST
+# In the remote shell:
+claude
+```
+
+No `tns agent` command or replacement interface is needed. tns recognizes
+Claude Code's bordered, single-line composer and learns whether literal edits
+are echoed as expected. After a few confirmed keystrokes it previews ordinary
+ASCII typing and backspace locally, then reconciles with Claude's real output.
+Only the input row is overlaid; Claude still renders its own transcript,
+menus, tools, and permission dialogs.
+
+This is conservative, experimental, layout-aware support—not prediction of
+arbitrary TUI behavior. It falls back to passthrough for unrecognized layouts,
+hidden cursors, multiline/wrapping or non-ASCII input, styled mentions, bulk
+pastes, menus, and control keys. It never predicts Enter or permission answers,
+submits a message, or runs a probe against Claude. A mismatched or expired
+preview is discarded. TUI text is not saved to the shell prediction cache.
+
+Disable this layer with `tns --no-tui-prediction HOST`. The exit summary reports
+TUI previews separately from shell predictions. See
+[in-session prediction](docs/in-session-prediction.md) for validation and limits.
+
 ### Transport: mosh (default) or ssh
 
 By default the session runs over `mosh --predict=never`, so you get everything

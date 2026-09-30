@@ -16,6 +16,7 @@ mod session;
 mod setup;
 mod shared;
 mod term;
+mod tui;
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -43,6 +44,7 @@ struct Args {
     bench: Option<PathBuf>,
     ssh: bool,
     shell: Option<String>,
+    tui_prediction: bool,
 }
 
 fn usage() -> ! {
@@ -62,13 +64,14 @@ fn usage_exit(code: i32) -> ! {
          --history N         how many recent history entries to learn (default 400)\n\
          --ssh               carry the session over plain ssh instead of mosh (the default)\n\
          --shell NAME        remote shell to start (bash, zsh, fish, ...); default: the login shell\n\
+         --no-tui-prediction disable local typing previews in recognized Claude Code composers\n\
          --debug             log to ~/.cache/tns/debug.log"
     );
     std::process::exit(code)
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { host: String::new(), probes: 6, calib_seconds: 12.0, history: 400, debug: false, dump: None, bench: None, ssh: false, shell: None };
+    let mut a = Args { host: String::new(), probes: 6, calib_seconds: 12.0, history: 400, debug: false, dump: None, bench: None, ssh: false, shell: None, tui_prediction: true };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let val = |it: &mut dyn Iterator<Item = String>| it.next().unwrap_or_else(|| usage());
@@ -79,6 +82,7 @@ fn parse_args() -> Args {
             "--debug" => a.debug = true,
             "--ssh" => a.ssh = true,
             "--mosh" => a.ssh = false,
+            "--no-tui-prediction" => a.tui_prediction = false,
             "--shell" => a.shell = Some(val(&mut it)),
             "--print-hooks" => {
                 // debugging aid: tns --print-hooks bash osc
@@ -462,6 +466,7 @@ struct Client {
     anchor_valid: bool,
     prompt_anchor: PromptAnchor,
     terminal_input: TerminalInput,
+    tui: tui::Predictor,
     last_out: Option<Instant>,
     rtt: f64,
     probes_started: bool,
@@ -593,6 +598,8 @@ impl Client {
             }
             match ev {
                 Event::Prompt => {
+                    self.tui.restore(&self.sess.em.screen, &mut self.out);
+                    self.tui.reset();
                     let now = if in_band { self.last_out.unwrap_or_else(Instant::now) } else { Instant::now() };
                     self.prompt_anchor.prompt(now, in_band);
                     self.anchor_valid = false;
@@ -663,7 +670,7 @@ impl Client {
 
         loop {
             let now = Instant::now();
-            let timeout = poll_timeout_ms(now, self.inflight_deadline().into_iter().chain(self.anchor_deadline()));
+            let timeout = poll_timeout_ms(now, self.inflight_deadline().into_iter().chain(self.anchor_deadline()).chain(self.tui.deadline(self.rtt)));
             let wake = self.chan.as_ref().map_or(-1, |c| c.wake_fd);
             let ready = poll_read(&[0, self.sess.pty.fd, wake], timeout);
 
@@ -672,6 +679,7 @@ impl Client {
                     c.drain(&mut self.sess.em.events);
                 }
                 self.handle_events(false);
+                self.flush();
             }
 
             if RESIZED.swap(false, Ordering::Relaxed) {
@@ -685,6 +693,7 @@ impl Client {
                 self.overlay_cursor = false;
                 self.anchor_valid = false;
                 self.prompt_anchor.resize(Instant::now());
+                self.tui.reset();
             }
 
             if ready[1] {
@@ -693,8 +702,10 @@ impl Client {
                     break;
                 }
                 self.restore_overlay();
-                let Client { sess, buf, out, terminal_input, .. } = self;
+                self.tui.restore(&self.sess.em.screen, &mut self.out);
+                let Client { sess, buf, out, terminal_input, tui, .. } = self;
                 terminal_input.output(&buf[..n]);
+                tui.output(&buf[..n]);
                 sess.em.feed(&buf[..n], out);
                 let now = Instant::now();
                 self.last_out = Some(now);
@@ -710,6 +721,15 @@ impl Client {
                     }
                 }
                 self.handle_events(true);
+                if self.args.tui_prediction {
+                    self.tui.observe(&self.sess.em.screen);
+                    if self.tui.active() {
+                        // An application's composer is not a shell prompt.
+                        self.anchor_valid = false;
+                        self.prompt_anchor.pending = false;
+                        self.clear_prediction();
+                    }
+                }
                 if self.anchor_valid && !self.inflight.is_empty() && !self.sess.em.screen.alt {
                     let k = self.key_of(&self.sess.em.screen.grid);
                     if let Some(i) = self.inflight.iter().position(|e| e.expected == Some(k)) {
@@ -719,6 +739,7 @@ impl Client {
                     self.rebuild_pred();
                 }
                 self.paint_overlay();
+                self.tui.paint(&self.sess.em.screen, &mut self.out);
                 self.flush();
             }
 
@@ -746,6 +767,18 @@ impl Client {
                     // count as a response to input we have only just sent.
                     let now = Instant::now();
                     let activity = self.terminal_input.input(unit);
+                    self.tui.restore(&self.sess.em.screen, &mut self.out);
+                    if !activity.protocol {
+                        if self.anchor_valid {
+                            self.tui.cancel();
+                        } else if self.tui.input(unit, now) {
+                            self.log("TUI literal edit preview");
+                        }
+                    } else if activity.user || !self.terminal_input.pending.is_empty() {
+                        self.tui.cancel();
+                    }
+                    self.tui.paint(&self.sess.em.screen, &mut self.out);
+                    self.flush();
                     if matches!(unit, b"\r" | b"\n" | b"\x03" | b"\x04" | b"\x0c") {
                         self.shared.with_stats(|s| s.keys += 1);
                         self.restore_overlay();
@@ -815,6 +848,12 @@ impl Client {
 
             // ---- timers: quiescence
             let now = Instant::now();
+            if self.tui.deadline(self.rtt).is_some_and(|t| now >= t) {
+                self.tui.restore(&self.sess.em.screen, &mut self.out);
+                self.tui.cancel();
+                self.log("TUI preview expired without a matching remote field");
+                self.flush();
+            }
             // Both channel orders are possible. Wait for a settled candidate
             // in the current epoch, and never capture a screen after typing.
             if self.anchor_deadline().is_some_and(|t| now >= t) {
@@ -849,6 +888,9 @@ impl Client {
                 let _ = self.shared.cache.lock().unwrap().save();
             }
         }
+        self.tui.restore(&self.sess.em.screen, &mut self.out);
+        self.tui.cancel();
+        self.flush();
     }
 }
 
@@ -1009,6 +1051,7 @@ fn main() {
         anchor_valid: false,
         prompt_anchor: PromptAnchor::new(Instant::now(), shell.has_hooks()),
         terminal_input: TerminalInput::default(),
+        tui: tui::Predictor::default(),
         last_out: None,
         rtt: 0.08,
         probes_started: false,
@@ -1027,7 +1070,7 @@ fn main() {
     let cache = shared.cache.lock().unwrap();
     let _ = writeln!(
         io::stdout(),
-        "tns: {} keys, {} predicted ({} confirmed, {} mispredicted), {} unpredicted, learned {} live + {} from {} probes, cache {} entries (~{} KB), rtt ~{:.0} ms",
+        "tns: {} keys, {} predicted ({} confirmed, {} mispredicted), {} unpredicted, learned {} live + {} from {} probes, cache {} entries (~{} KB), rtt ~{:.0} ms; TUI {} previewed ({} matched, {} discarded)",
         s.keys,
         s.predicted,
         s.hit,
@@ -1038,7 +1081,10 @@ fn main() {
         s.probed,
         cache.len(),
         cache.mem_bytes() / 1024,
-        client.rtt * 1000.0
+        client.rtt * 1000.0,
+        client.tui.predicted,
+        client.tui.confirmed,
+        client.tui.discarded
     );
     drop(cache);
     drop(client);

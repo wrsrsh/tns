@@ -167,6 +167,7 @@ pub struct Screen {
     insert: bool,
     lnm: bool,
     pub alt: bool,
+    pub cursor_visible: bool,
     alt_cursor: (usize, usize),
     pub dirty: bool,
     /// When false, DECSET 47/1047/1049 are ignored and drawing continues on
@@ -186,6 +187,7 @@ impl Screen {
             insert: false,
             lnm: false,
             alt: false,
+            cursor_visible: true,
             alt_cursor: (0, 0),
             dirty: false,
             track_alt: true,
@@ -201,6 +203,10 @@ impl Screen {
         self.alt_cursor.1 = self.alt_cursor.1.saturating_sub(dropped_rows).min(rows - 1);
         self.margins = None;
         self.dirty = true;
+    }
+
+    pub fn attrs(&self) -> Cell {
+        self.attrs
     }
 
     #[inline]
@@ -242,6 +248,7 @@ impl Screen {
         self.origin = false;
         self.insert = false;
         self.lnm = false;
+        self.cursor_visible = true;
         self.dirty = true;
     }
 
@@ -533,6 +540,7 @@ impl Screen {
             let m = p[0];
             if private {
                 match m {
+                    25 => self.cursor_visible = on,
                     7 => self.autowrap = on,
                     6 => {
                         self.origin = on;
@@ -695,6 +703,18 @@ mod tests {
     }
     fn text(g: &Grid, y: usize) -> String {
         g.row(y).iter().filter_map(|c| c.chr()).collect::<String>().trim_end().to_string()
+    }
+
+    #[test]
+    fn cursor_visibility_is_tracked_even_in_alternate_screen() {
+        let mut s = Screen::new(20, 4);
+        assert!(s.cursor_visible);
+        feed(&mut s, b"\x1b[?25l");
+        assert!(!s.cursor_visible);
+        feed(&mut s, b"\x1b[?1049h\x1b[?25h");
+        assert!(s.alt && s.cursor_visible);
+        feed(&mut s, b"\x1b[?1049l\x1b[?25l\x1bc");
+        assert!(!s.alt && s.cursor_visible);
     }
 
     #[test]

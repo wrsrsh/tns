@@ -119,7 +119,7 @@ while True:
 
 
 class Client:
-    def __init__(self, root, scenario=None, wait_anchor=True, ssh=False):
+    def __init__(self, root, scenario=None, wait_anchor=True, ssh=False, extra_args=()):
         self.home = root / "home"
         self.home.mkdir()
         mock = root / "bin"
@@ -133,7 +133,7 @@ class Client:
             fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
             os.environ.update(PATH=str(mock) + ":" + os.environ["PATH"], HOME=str(self.home), TERM="xterm-256color")
             os.environ["TNS_CLIENT_SCENARIO"] = scenario or ""
-            os.execv(str(BIN), [str(BIN), *(["--ssh"] if ssh or not scenario else []), "--probes", "0", "--history", "0", "--debug", "fake-host"])
+            os.execv(str(BIN), [str(BIN), *(["--ssh"] if ssh or not scenario else []), "--probes", "0", "--history", "0", "--debug", *extra_args, "fake-host"])
         self.output = bytearray()
         if wait_anchor:
             try:
