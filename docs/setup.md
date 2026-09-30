@@ -35,7 +35,7 @@ preferred toolchain manager. Check `cargo --version` and `cc --version`.
 Then build the released client:
 
 ```sh
-cargo install --git https://github.com/wrsrsh/tns --tag v0.6.0 --locked
+cargo install --git https://github.com/wrsrsh/tns --tag v0.6.1 --locked
 ```
 
 Cargo normally installs into `~/.cargo/bin`. If `tns` is not found, add that
@@ -251,7 +251,7 @@ sh install-tns.sh local --check
 sh install-tns.sh remote --check
 ```
 
-For a Linux source install, `TNS_VERSION=0.6.0 sh install-tns.sh local` can pin
+For a Linux source install, `TNS_VERSION=0.6.1 sh install-tns.sh local` can pin
 a release explicitly. Homebrew installations follow the tap's current version.
 The script no longer assumes a local role when called without arguments, and
 no longer launches an interactive wizard after installation.

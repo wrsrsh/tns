@@ -14,6 +14,7 @@ import select
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -56,6 +57,9 @@ elif any('/run' in arg for arg in sys.argv):
             break
         time.sleep(.10)
         if data == b'\x03':
+            delay = Path(os.environ['HOME']) / 'reset-delay'
+            if delay.exists():
+                time.sleep(float(delay.read_text()))
             os.write(1, b'\r\n\x1b]133;A\x07$ ')
         else:
             os.write(1, data)
@@ -88,10 +92,16 @@ if mode == 'terminal-replies':
     event()
 elif mode == 'event-first':
     event()
-    time.sleep(.08)
-    screen(b'$')
-    time.sleep(.06)
-    screen(b' ')
+    # The test acknowledges client receipt, not just the event producer's write.
+    while not (home / 'event-observed').exists():
+        time.sleep(.005)
+    # Split inside the prompt's SGR prefix: neither fragment alone is a
+    # complete prompt. Splitting '$' and ' ' with a sleep instead assumes the
+    # producer wakes within the client's 120 ms quiet window; CI need not do so.
+    screen(b'\x1b[0m\x1b[0')  # complete zero-width marker, then partial SGR
+    while not (home / 'finish-prompt').exists():
+        time.sleep(.005)
+    screen(b'm$ ')
 elif mode == 'stale-screen':
     screen(b'old command output')
     time.sleep(1.3)
@@ -124,10 +134,12 @@ class Client:
         self.home.mkdir()
         mock = root / "bin"
         mock.mkdir()
-        (mock / "ssh").write_text(SSH)
-        (mock / "ssh").chmod(0o755)
-        (mock / "mosh").write_text(MOSH)
-        (mock / "mosh").chmod(0o755)
+        # bin/check may use a venv while PATH's python3 is a different version.
+        # Run both fixtures with the same interpreter as the test harness.
+        for name, source in (("ssh", SSH), ("mosh", MOSH)):
+            script = mock / name
+            script.write_text(source.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1))
+            script.chmod(0o755)
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
@@ -170,6 +182,13 @@ class Client:
         os.write(self.fd, data)
         self.pump(delay)
 
+    def reset_prompt(self):
+        anchors = self.log().count("anchor=")
+        self.send(b"\x03", 0)
+        # A remote echo/reset and the client's quiet timer must both finish
+        # before typing; a fixed send delay can cancel the pending anchor.
+        self.wait_for(lambda: self.log().count("anchor=") > anchors)
+
     def idle_cpu(self):
         def cpu():
             text = subprocess.check_output(["ps", "-p", str(self.pid), "-o", "time="], text=True).strip()
@@ -180,14 +199,13 @@ class Client:
         return cpu() - before
 
     def finish(self):
-        self.send(b"\x04", .5)
-        match = re.search(
+        self.send(b"\x04", 0)
+        pattern = (
             rb"tns: \d+ keys, (\d+) predicted \((\d+) confirmed, (\d+) mispredicted\), "
-            rb"(\d+) unpredicted, learned (\d+) live", self.output
+            rb"(\d+) unpredicted, learned (\d+) live"
         )
-        if not match:
-            raise AssertionError(bytes(self.output))
-        return tuple(map(int, match.groups()))
+        self.wait_for(lambda: re.search(pattern, self.output) is not None)
+        return tuple(map(int, re.search(pattern, self.output).groups()))
 
     def close(self):
         waited, _ = os.waitpid(self.pid, os.WNOHANG)
@@ -214,21 +232,29 @@ class BurstRegressions(unittest.TestCase):
         self.assertLess(self.client.idle_cpu(), .15, "client busy-polls after burst output")
         self.client.send(b"c")
         # A fresh prompt must not find an incorrectly learned a -> ab diff.
-        self.client.send(b"\x03")
+        self.client.reset_prompt()
         self.client.send(b"a")
         self.assertEqual(self.client.finish(), (0, 0, 0, 4, 2))
 
-    def test_predicted_burst_keeps_normal_acknowledgments(self):
+    def assert_predicted_burst(self):
         for key in (b"a", b"b", b"c"):
             self.client.send(key)
-        self.client.send(b"\x03")
+        self.client.reset_prompt()
         self.client.send(b"ab", .7)
         self.client.send(b"c")
         self.assertEqual(self.client.finish(), (3, 3, 0, 3, 3))
 
+    def test_predicted_burst_keeps_normal_acknowledgments(self):
+        self.assert_predicted_burst()
+
+    def test_predicted_burst_waits_for_delayed_reset(self):
+        # Exceed the old 300 ms send budget, without changing key echoes/acks.
+        (self.client.home / "reset-delay").write_text(".35")
+        self.assert_predicted_burst()
+
     def test_mixed_predicted_prefix_and_uncached_suffix_recovers(self):
         self.client.send(b"a")
-        self.client.send(b"\x03")
+        self.client.reset_prompt()
         self.client.send(b"ab", .7)
         self.client.send(b"c")
         predicted, _, _, unpredicted, learned = self.client.finish()
@@ -243,8 +269,7 @@ class PromptRegressions(unittest.TestCase):
         self.addCleanup(client.close)
         return client
 
-    def assert_prompt(self, scenario):
-        client = self.client(scenario)
+    def assert_prompt(self, client):
         self.assertIn("anchor=(0, 2)", client.log())
         self.assertEqual(client.log().count("anchor="), 1)
         client.send(b"a")
@@ -252,10 +277,24 @@ class PromptRegressions(unittest.TestCase):
         self.assertEqual(client.finish(), (0, 0, 0, 1, 1))
 
     def test_event_after_prompt_screen(self):
-        self.assert_prompt("screen-first")
+        self.assert_prompt(self.client("screen-first"))
 
     def test_event_before_split_prompt_screen(self):
-        self.assert_prompt("event-first")
+        client = self.client("event-first", wait_anchor=False)
+        client.wait_for(lambda: "event prompt" in client.log())
+        self.assertNotIn("anchor=", client.log())
+        (client.home / "event-observed").touch()
+        client.wait_for(lambda: b"\x1b[0m" in client.output)
+        # Force distinct PTY reads, even if the runner pauses either process.
+        # The incomplete prefix must not anchor, even past the quiet window.
+        # Exact quiet-window restart arithmetic for two rendered frames is
+        # covered by prompt_event_before_screen_waits_for_quiet_output in Rust.
+        client.pump(.2)
+        self.assertNotIn("anchor=", client.log())
+        self.assertNotIn(b"$", client.output)
+        (client.home / "finish-prompt").touch()
+        client.wait_for(lambda: "anchor=" in client.log())
+        self.assert_prompt(client)
 
     def test_startup_terminal_replies_do_not_count_as_typing(self):
         for ssh in (False, True):
