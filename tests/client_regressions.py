@@ -55,6 +55,14 @@ elif any('/run' in arg for arg in sys.argv):
         data = os.read(0, 4096)
         if not data or b'\x04' in data:
             break
+        home = Path(os.environ['HOME'])
+        with (home / 'shell-input').open('ab') as received:
+            received.write(data)
+        while (home / 'hold-shell-echo').exists():
+            time.sleep(.005)
+        if (home / 'rewrite-shell').exists():
+            os.write(1, b'\r\x1b[2K$ rewritten')
+            continue
         time.sleep(.10)
         if data == b'\x03':
             delay = Path(os.environ['HOME']) / 'reset-delay'
@@ -145,7 +153,7 @@ class Client:
             fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
             os.environ.update(PATH=str(mock) + ":" + os.environ["PATH"], HOME=str(self.home), TERM="xterm-256color")
             os.environ["TNS_CLIENT_SCENARIO"] = scenario or ""
-            os.execv(str(BIN), [str(BIN), *(["--ssh"] if ssh or not scenario else []), "--probes", "0", "--history", "0", "--debug", *extra_args, "fake-host"])
+            os.execv(str(BIN), [str(BIN), "--ssh" if ssh or not scenario else "--mosh-client", "--probes", "0", "--history", "0", "--debug", *extra_args, "fake-host"])
         self.output = bytearray()
         if wait_anchor:
             try:
@@ -259,6 +267,55 @@ class BurstRegressions(unittest.TestCase):
         self.client.send(b"c")
         predicted, _, _, unpredicted, learned = self.client.finish()
         self.assertEqual((predicted, unpredicted, learned), (1, 3, 2))
+
+    def test_uncached_typing_is_previewed_before_echo_and_forwarded_exactly_once(self):
+        for key in (b"a", b"b"):
+            self.client.send(key)
+        hold = self.client.home / "hold-shell-echo"
+        hold.touch()
+        self.client.send(b"cd", .03)
+        self.client.wait_for(lambda: self.client.log().count("shell literal edit preview") == 2)
+        self.client.wait_for(lambda: (self.client.home / "shell-input").read_bytes().startswith(b"abc"))
+        # The PTY's authoritative echo is held; these bytes are local paint.
+        self.assertIn(b"cd", self.client.output)
+        hold.unlink()
+        self.client.wait_for(lambda: (self.client.home / "shell-input").read_bytes() == b"abcd")
+        self.client.pump(.7)
+        self.client.finish()
+        self.assertIn(b"shell 2 previewed (2 matched, 0 discarded)", self.client.output)
+
+    def test_uncached_preview_expires_without_echo(self):
+        for key in (b"a", b"b"):
+            self.client.send(key)
+        hold = self.client.home / "hold-shell-echo"
+        hold.touch()
+        self.client.send(b"c", .03)
+        self.client.wait_for(lambda: "shell literal edit preview" in self.client.log())
+        self.client.wait_for(lambda: "shell preview expired" in self.client.log())
+        self.assertLess(self.client.idle_cpu(), .15)
+        hold.unlink()
+        self.client.pump(.3)
+        self.client.finish()
+        self.assertIn(b"shell 1 previewed (0 matched, 1 discarded)", self.client.output)
+
+    def test_rewritten_command_discards_literal_preview(self):
+        for key in (b"a", b"b"):
+            self.client.send(key)
+        (self.client.home / "rewrite-shell").touch()
+        self.client.send(b"c", .3)
+        self.client.finish()
+        self.assertIn(b"shell 1 previewed (0 matched, 1 discarded)", self.client.output)
+
+    def test_literal_shell_preview_can_be_disabled(self):
+        tmp = tempfile.TemporaryDirectory(prefix="tns-shell-opt-out-")
+        self.addCleanup(tmp.cleanup)
+        client = Client(Path(tmp.name), extra_args=["--no-shell-prediction"])
+        self.addCleanup(client.close)
+        for key in (b"a", b"b", b"c"):
+            client.send(key)
+        client.finish()
+        self.assertNotIn("shell literal edit preview", client.log())
+        self.assertIn(b"shell 0 previewed (0 matched, 0 discarded)", client.output)
 
 
 class PromptRegressions(unittest.TestCase):

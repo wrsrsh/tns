@@ -17,10 +17,10 @@ pub fn wait_quiet(sess: &mut Session, buf: &mut [u8], scratch: &mut Vec<u8>, fir
     let deadline = Instant::now() + first;
     loop {
         let timeout = if got > 0 { quiet } else { deadline.saturating_duration_since(Instant::now()) };
-        if !poll_read(&[sess.pty.fd], timeout.as_millis() as i32)[0] {
+        if !poll_read(&[sess.fd()], timeout.as_millis() as i32)[0] {
             return got;
         }
-        let n = sess.pty.read(buf);
+        let n = sess.read(buf);
         if n == 0 {
             return -1;
         }
@@ -158,7 +158,7 @@ impl Prober {
                 }
                 burst.clear();
                 burst.extend(&chars[i..j]);
-                if sess.pty.write(burst.as_bytes()).is_err() {
+                if sess.write(burst.as_bytes()).is_err() {
                     break false;
                 }
                 typed = true;
@@ -169,7 +169,7 @@ impl Prober {
                 continue;
             }
             self.pre.copy_from(&sess.em.screen.grid);
-            if sess.pty.write(ch.encode_utf8(&mut utf8).as_bytes()).is_err() {
+            if sess.write(ch.encode_utf8(&mut utf8).as_bytes()).is_err() {
                 break false;
             }
             typed = true;
@@ -188,7 +188,7 @@ impl Prober {
             return false;
         }
         if typed {
-            if sess.pty.write(b"\x15").is_err() {
+            if sess.write(b"\x15").is_err() {
                 return false;
             }
             if wait_quiet(&mut sess, &mut self.buf, &mut self.scratch, Duration::from_secs(1), Duration::from_millis(60)) < 0 {

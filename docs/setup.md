@@ -16,7 +16,8 @@ tns --version
 tns setup --local
 ```
 
-Homebrew installs mosh and the Rust build dependency for you. Install
+Homebrew installs the Rust build dependency for you (and mosh, which tns
+itself only needs on the remote machine). Install
 [Homebrew](https://brew.sh) first if you want this installation method; tns's
 installer does not bootstrap a package manager without your involvement.
 
@@ -27,15 +28,18 @@ build dependencies:
 
 ```sh
 sudo apt-get update
-sudo apt-get install openssh-client mosh build-essential
+sudo apt-get install openssh-client build-essential
 ```
+
+tns contains its own mosh client. Install the `mosh` package locally as well
+only if you want the `--mosh-client` fallback.
 
 Install a current Rust toolchain using [rustup](https://rustup.rs) or your
 preferred toolchain manager. Check `cargo --version` and `cc --version`.
 Then build the released client:
 
 ```sh
-cargo install --git https://github.com/wrsrsh/tns --tag v0.6.1 --locked
+cargo install --git https://github.com/wrsrsh/tns --tag v0.7.0 --locked
 ```
 
 Cargo normally installs into `~/.cargo/bin`. If `tns` is not found, add that
@@ -200,7 +204,8 @@ keys, write SSH config, install packages, or upload tns session hooks.
 
 - `tns setup` or `tns setup --local`: checks the local machine only. No SSH
   alias is selected automatically, even if only one is configured.
-- `tns setup HOST`: checks local and remote requirements for mosh.
+- `tns setup HOST`: checks local and remote requirements for mosh. A local
+  mosh client is reported but not required.
 - `tns setup --ssh HOST`: checks requirements for the SSH-only mode.
 - Exit `0`: checked requirements passed; `1`: action is needed; `2`: bad arguments.
 
@@ -251,7 +256,7 @@ sh install-tns.sh local --check
 sh install-tns.sh remote --check
 ```
 
-For a Linux source install, `TNS_VERSION=0.6.1 sh install-tns.sh local` can pin
+For a Linux source install, `TNS_VERSION=0.7.0 sh install-tns.sh local` can pin
 a release explicitly. Homebrew installations follow the tap's current version.
 The script no longer assumes a local role when called without arguments, and
 no longer launches an interactive wizard after installation.
@@ -277,7 +282,9 @@ only if you also want to discard learned predictions and debug logs.
 | SSH works with a password but setup fails | Configure local SSH-agent/key authentication and test `ssh -o BatchMode=yes HOST true`. |
 | Host-key verification fails | Verify the host's fingerprint using normal interactive SSH. Do not bypass verification. |
 | mosh-server missing | Install `mosh` on the remote, not tns. |
-| Requirements pass but mosh waits for the server | Check UDP routing, firewall rules, VPN ACLs, and cloud security groups. Try `tns --ssh HOST` to isolate the transport. |
+| The screen stays empty and the first row says there is no reply from the mosh server | UDP is not getting through. Check UDP routing, firewall rules, VPN ACLs, and cloud security groups for ports 60000–61000. Press `Ctrl-^ .` to quit, and try `tns --ssh HOST` to isolate the transport. |
+| "last contact N s ago" appears on the first row | The network dropped. The session resumes by itself when the server is reachable again; `Ctrl-^ .` quits. |
+| A problem appears only with the built-in mosh client | `tns --mosh-client HOST` runs the `mosh` program instead (install it locally). Please report the difference. |
 | Claude not found or not logged in | Install and authenticate Claude on the remote. |
 | Claude typing is not predicted | The composer must match the supported layout. See [prediction limits](in-session-prediction.md). Unknown layouts pass through normally. |
 | An old setup command claimed “Ready” despite a failed check | Upgrade to tns 0.6.0 or later. Setup now exits unsuccessfully for missing requirements. |

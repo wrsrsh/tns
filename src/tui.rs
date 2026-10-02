@@ -1,7 +1,8 @@
-//! A conservative local preview over Claude Code's *existing* terminal UI.
+//! Conservative local previews for shell cache misses and Claude Code's UI.
 //!
 //! No agent protocol, replacement UI, generated input, or persistent cache.
-//! Learn literal editing only inside a recognized, single-line composer.
+//! Learn literal editing only inside a hook-identified shell command line or
+//! a recognized, single-line composer.
 //! Observed text/cursor matches are evidence, not server-side input ACKs:
 //! uncertain layouts and nonliteral actions always fall back to passthrough.
 
@@ -97,6 +98,8 @@ impl Boundary {
 struct Field {
     row: usize,
     cols: usize,
+    start: usize,
+    shell: bool,
     text: Vec<u8>,
     cursor: usize,
     style: Cell,
@@ -106,30 +109,35 @@ impl Field {
     const START: usize = 2;
 
     fn same_layout(&self, other: &Self) -> bool {
-        self.row == other.row && self.cols == other.cols && self.style == other.style
+        self.row == other.row && self.cols == other.cols && self.start == other.start
+            && self.shell == other.shell && (self.shell || self.style == other.style)
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.same_layout(other) && self.text == other.text && self.cursor == other.cursor
     }
 
     fn edit(&self, input: &[u8]) -> Option<Self> {
-        // Cursor-at-start is ambiguous with Claude's placeholder. Never guess
-        // it away, or synthesize the first character of an unknown field.
-        if self.cursor == 0 || self.text.starts_with(b"/") || self.text.starts_with(b"!") {
+        // Cursor-at-start is ambiguous with Claude's placeholder. Shell
+        // identity comes from its prompt hook, so an empty command is known.
+        if !self.shell && (self.cursor == 0 || self.text.starts_with(b"/") || self.text.starts_with(b"!")) {
             return None;
         }
         let mut next = self.clone();
         match input {
-            [b'\x7f'] if self.text.len() > 1 => {
+            [b'\x7f'] if !self.shell && self.text.len() > 1 => {
                 next.text.remove(next.cursor - 1);
                 next.cursor -= 1;
             }
-            [b] if (0x20..=0x7e).contains(b) && *b != b'@' => {
+            [b] if (0x20..=0x7e).contains(b) && (self.shell || *b != b'@') => {
                 next.text.insert(next.cursor, *b);
                 next.cursor += 1;
             }
             _ => return None,
         }
         // Leave wrapping, slash/bang modes and mention pickers to the app.
-        if next.text.len() + Self::START >= self.cols - 1
-            || next.text.starts_with(b"/") || next.text.starts_with(b"!")
+        if next.text.len() + self.start >= self.cols - 1
+            || (!self.shell && (next.text.starts_with(b"/") || next.text.starts_with(b"!")))
         {
             return None;
         }
@@ -176,7 +184,31 @@ fn composer(screen: &Screen) -> Option<Field> {
     {
         return None;
     }
-    Some(Field { row: g.cy, cols: g.cols, text, cursor: g.cx - Field::START, style })
+    Some(Field { row: g.cy, cols: g.cols, start: Field::START, shell: false, text, cursor: g.cx - Field::START, style })
+}
+
+/// Only the hook-identified shell command prefix is editable. Autosuggestions
+/// and right prompts are left authoritative; matching ignores syntax colors.
+fn shell_field(screen: &Screen, anchor: (usize, usize)) -> Option<Field> {
+    let g = &screen.grid;
+    let (row, start) = anchor;
+    if screen.alt || !screen.cursor_visible || g.cy != row || row >= g.rows
+        || start > g.cx || g.cx >= g.cols.saturating_sub(1)
+    {
+        return None;
+    }
+    let mut text = Vec::new();
+    for cell in &g.row(row)[start..g.cx] {
+        if !(0x20..=0x7e).contains(&cell.ch) || cell.flags() & F_REVERSE != 0 {
+            return None;
+        }
+        text.push(cell.ch as u8);
+    }
+    if !text.is_empty() && text.iter().all(|&b| b == b'*') {
+        return None;
+    }
+    let style = Cell { ch: b' ' as u32, ..if g.cx > start { g.row(row)[g.cx - 1] } else { screen.attrs() } };
+    Some(Field { row, cols: g.cols, start, shell: true, cursor: text.len(), text, style })
 }
 
 fn claude_banner(screen: &Screen) -> bool {
@@ -199,7 +231,7 @@ pub struct Predictor {
     current: Option<Field>,
     confidence: usize,
     pending: VecDeque<Pending>,
-    overlay: Option<(usize, usize)>, // row, exclusive end column
+    overlay: Option<(usize, usize, usize)>, // row, start, exclusive end column
     pub predicted: u64,
     pub confirmed: u64,
     pub discarded: u64,
@@ -244,16 +276,33 @@ impl Predictor {
             }
             self.identified = true;
         }
+        self.observe_field(field);
+    }
+
+    /// The caller supplies an anchor only while a confirmed shell prompt is
+    /// active. Never infer shell identity from arbitrary application output.
+    pub fn observe_shell(&mut self, screen: &Screen, anchor: (usize, usize)) {
+        if !self.boundary.safe() {
+            return;
+        }
+        if let Some(field) = shell_field(screen, anchor) {
+            self.observe_field(field);
+        } else {
+            self.cancel();
+        }
+    }
+
+    fn observe_field(&mut self, field: Field) {
         if self.current.as_ref().is_some_and(|old| !old.same_layout(&field)) {
             self.cancel();
         }
-        if let Some(i) = self.pending.iter().rposition(|p| p.expected == field) {
+        if let Some(i) = self.pending.iter().rposition(|p| p.expected.matches(&field)) {
             // One Mosh update may confirm several coalesced edits.
             for p in self.pending.drain(..=i) {
                 self.confirmed += u64::from(p.shown);
                 self.confidence = (self.confidence + 1).min(CONFIRMATIONS);
             }
-        } else if self.current.as_ref() != Some(&field) {
+        } else if !self.current.as_ref().is_some_and(|old| old.matches(&field)) {
             // Completion, history, a moved cursor, or a rewritten input. Never
             // apply old guesses to a newly changed field.
             self.cancel();
@@ -264,6 +313,11 @@ impl Predictor {
     /// Called only for actual user input, which the caller sends unchanged.
     /// Returns true iff this key is being locally previewed.
     pub fn input(&mut self, input: &[u8], now: Instant) -> bool {
+        self.input_with_preview(input, now, true)
+    }
+
+    /// Track cached edits too, but paint a literal fallback only on a miss.
+    pub fn input_with_preview(&mut self, input: &[u8], now: Instant, preview: bool) -> bool {
         if !self.boundary.safe() || self.pending.len() >= MAX_PENDING {
             self.cancel();
             return false;
@@ -276,11 +330,11 @@ impl Predictor {
         // An edit cycle (e.g. type then immediately backspace) can look exactly
         // like an old, unacknowledged frame. Without server input ACKs, do not
         // mistake that repeated state for confirmation of the whole cycle.
-        if self.current.as_ref() == Some(&next) || self.pending.iter().any(|p| p.expected == next) {
+        if self.current.as_ref().is_some_and(|old| old.matches(&next)) || self.pending.iter().any(|p| p.expected.matches(&next)) {
             self.cancel();
             return false;
         }
-        let shown = self.confidence >= CONFIRMATIONS;
+        let shown = preview && self.confidence >= CONFIRMATIONS;
         self.predicted += u64::from(shown);
         self.pending.push_back(Pending { expected: next, sent: now, shown });
         shown
@@ -293,11 +347,11 @@ impl Predictor {
     /// Restore before parsing *any* new remote bytes: their cursor-relative
     /// writes must see the actual cursor and attributes, not the local guess.
     pub fn restore(&mut self, screen: &Screen, out: &mut Vec<u8>) {
-        let Some((row, end)) = self.overlay.take() else { return; };
+        let Some((row, start, end)) = self.overlay.take() else { return; };
         let g = &screen.grid;
         if row < g.rows {
             let mut w = RunWriter::new(out);
-            for x in Field::START..end.min(g.cols) {
+            for x in start..end.min(g.cols) {
                 w.cell(row, x, &g.row(row)[x]);
             }
             w.finish();
@@ -317,18 +371,22 @@ impl Predictor {
         if !current.same_layout(next) || next.row >= g.rows || next.cols != g.cols {
             return;
         }
-        let end = Field::START + current.text.len().max(next.text.len());
+        let end = next.start + current.text.len().max(next.text.len());
         let mut w = RunWriter::new(out);
-        for x in Field::START..end {
-            let c = Cell { ch: next.text.get(x - Field::START).copied().unwrap_or(b' ') as u32, ..next.style };
+        for x in next.start..end {
+            let c = if next.shell && x < next.start + current.text.len() {
+                g.row(next.row)[x]
+            } else {
+                Cell { ch: next.text.get(x - next.start).copied().unwrap_or(b' ') as u32, ..current.style }
+            };
             if c != g.row(next.row)[x] {
                 w.cell(next.row, x, &c);
             }
         }
         w.finish();
-        cup(out, next.row, Field::START + next.cursor);
+        cup(out, next.row, next.start + next.cursor);
         sgr(out, &screen.attrs());
-        self.overlay = Some((next.row, end));
+        self.overlay = Some((next.row, next.start, end));
     }
 }
 
@@ -542,5 +600,66 @@ mod tests {
         assert_eq!(p.confirmed, 0);
         assert_eq!(p.discarded, 1);
         assert_eq!(p.confidence, 0);
+    }
+
+    fn shell_screen(text: &str) -> Screen {
+        let mut s = Screen::new(80, 24);
+        let mut parser = vte::Parser::new();
+        parser.advance(&mut s, format!("$ {text}").as_bytes());
+        s
+    }
+
+    #[test]
+    fn shell_cache_misses_preview_after_observed_echo_and_ignore_suggestion_changes() {
+        let mut p = Predictor::default();
+        p.observe_shell(&shell_screen(""), (0, 2));
+        assert!(!p.input(b"a", Instant::now()));
+        p.observe_shell(&shell_screen("a"), (0, 2));
+        assert!(!p.input(b"b", Instant::now()));
+        let mut actual = shell_screen("ab");
+        actual.grid.row_mut(0)[2].fga = 123; // syntax highlighting can change
+        actual.grid.row_mut(0)[4].ch = b'Z' as u32; // new autosuggestion
+        p.observe_shell(&actual, (0, 2));
+        assert!(p.input(b"c", Instant::now()));
+        assert!(p.input(b"d", Instant::now()));
+        let mut presented = shell_screen("ab");
+        presented.grid.copy_from(&actual.grid);
+        let mut out = Vec::new();
+        p.paint(&actual, &mut out);
+        let mut parser = vte::Parser::new();
+        parser.advance(&mut presented, &out);
+        assert_eq!(presented.grid.row(0)[2], actual.grid.row(0)[2]);
+        assert_eq!(presented.grid.row(0)[4].ch, b'c' as u32);
+        assert_eq!(presented.grid.row(0)[5].ch, b'd' as u32);
+        assert_eq!(presented.grid.cx, 6);
+        out.clear();
+        p.restore(&actual, &mut out);
+        parser.advance(&mut presented, &out);
+        assert_eq!(presented.grid.cells, actual.grid.cells);
+        assert_eq!(presented.grid.cx, actual.grid.cx);
+        p.observe_shell(&shell_screen("abcd"), (0, 2));
+        assert_eq!((p.predicted, p.confirmed, p.discarded), (2, 2, 0));
+    }
+
+    #[test]
+    fn cached_shell_edits_train_without_double_painting_and_controls_reset_confidence() {
+        let mut p = Predictor::default();
+        p.observe_shell(&shell_screen(""), (0, 2));
+        for key in [b"a", b"b"] {
+            assert!(!p.input_with_preview(key, Instant::now(), false));
+            let text = if key == b"a" { "a" } else { "ab" };
+            p.observe_shell(&shell_screen(text), (0, 2));
+        }
+        assert!(!p.input_with_preview(b"c", Instant::now(), false));
+        let mut out = Vec::new();
+        p.paint(&shell_screen("ab"), &mut out);
+        assert!(out.is_empty());
+        p.observe_shell(&shell_screen("abc"), (0, 2));
+        assert!(p.input(b"d", Instant::now()));
+        assert!(!p.input(b"\x1b[D", Instant::now()));
+        assert_eq!(p.confidence, 0);
+        assert!(p.pending.is_empty());
+        p.observe_shell(&shell_screen("Password: "), (1, 2));
+        assert!(!p.active());
     }
 }

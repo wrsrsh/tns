@@ -14,3 +14,4 @@ export TNS_BIN
 "$PYTHON" tests/install_regressions.py
 "$PYTHON" tests/client_regressions.py
 "$PYTHON" tests/tui_prediction.py
+"$PYTHON" tests/native_regressions.py

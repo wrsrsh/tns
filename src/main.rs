@@ -1,14 +1,18 @@
-//! tns: a predictive terminal for a remote fish shell.
+//! tns: a predictive terminal for a remote shell.
 //!
-//! The real shell runs on the remote host over ssh.  Locally we keep a model
-//! of the remote screen and a cache of "what does the screen look like after
-//! key K is pressed in state S".  Keystrokes are painted from the cache
-//! instantly and reconciled when the real bytes arrive.  The cache is seeded
-//! by hidden probe sessions that type your history into the remote shell,
-//! and it keeps learning from every keystroke you type.
+//! The real shell runs on the remote host, reached over mosh's protocol
+//! (`mosh`) or a plain ssh pty.  Locally we keep a model of the remote screen
+//! and a cache of "what does the screen look like after key K is pressed in
+//! state S".  Keystrokes are painted from the cache instantly and reconciled
+//! when the real screen arrives; keys the cache does not know are echoed
+//! literally (`echo`).  The cache is seeded by hidden probe sessions that
+//! type your history into the remote shell, and it keeps learning from every
+//! keystroke you type.
 
 mod agent;
 mod cache;
+mod echo;
+mod mosh;
 mod paint;
 mod probe;
 mod remote;
@@ -27,10 +31,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cache::{key_hash, state_hash, Anchor, Cache, Key};
-use paint::{cup, RunWriter};
+use paint::{cup, redraw, repaint, sgr, RunWriter};
 use probe::Prober;
 use remote::{Shell, Sink};
-use session::{poll_read, Emulator, Event, EventChannel, Session, Transport};
+use session::{poll_read, Emulator, Event, EventChannel, Link, Session, Transport};
 use shared::{Shared, Stats};
 use term::Grid;
 
@@ -43,8 +47,10 @@ struct Args {
     dump: Option<(usize, usize)>,
     bench: Option<PathBuf>,
     ssh: bool,
+    mosh_client: bool,
     shell: Option<String>,
     tui_prediction: bool,
+    shell_prediction: bool,
 }
 
 fn usage() -> ! {
@@ -53,7 +59,7 @@ fn usage() -> ! {
 
 fn usage_exit(code: i32) -> ! {
     eprintln!(
-        "usage: tns [--ssh] [--shell NAME] [--probes N] [--calib-seconds S] [--history N] [--debug] HOST\n\
+        "usage: tns [--ssh | --mosh-client] [--shell NAME] [--probes N] [--calib-seconds S] [--history N] [--debug] HOST\n\
          \x20      tns --dump-screen COLSxROWS < bytes   (emulator test mode)\n\
          \x20      tns --bench CAPTURE.bin               (micro benchmarks)\n\
          \x20      tns agent <claude|codex|pi|opencode> HOST   (local UI for a remote agent, see tns agent --help)\n\
@@ -63,15 +69,17 @@ fn usage_exit(code: i32) -> ! {
          --calib-seconds S   burst calibration time; afterwards one probe keeps learning (default 12)\n\
          --history N         how many recent history entries to learn (default 400)\n\
          --ssh               carry the session over plain ssh instead of mosh (the default)\n\
+         --mosh-client       use the installed mosh program instead of tns's built-in mosh client\n\
          --shell NAME        remote shell to start (bash, zsh, fish, ...); default: the login shell\n\
-         --no-tui-prediction disable local typing previews in recognized Claude Code composers\n\
+         --no-tui-prediction disable local typing previews inside applications\n\
+         --no-shell-prediction disable literal typing previews on shell cache misses\n\
          --debug             log to ~/.cache/tns/debug.log"
     );
     std::process::exit(code)
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { host: String::new(), probes: 6, calib_seconds: 12.0, history: 400, debug: false, dump: None, bench: None, ssh: false, shell: None, tui_prediction: true };
+    let mut a = Args { host: String::new(), probes: 6, calib_seconds: 12.0, history: 400, debug: false, dump: None, bench: None, ssh: false, mosh_client: false, shell: None, tui_prediction: true, shell_prediction: true };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let val = |it: &mut dyn Iterator<Item = String>| it.next().unwrap_or_else(|| usage());
@@ -81,8 +89,10 @@ fn parse_args() -> Args {
             "--history" => a.history = val(&mut it).parse().unwrap_or_else(|_| usage()),
             "--debug" => a.debug = true,
             "--ssh" => a.ssh = true,
-            "--mosh" => a.ssh = false,
+            "--mosh" => (a.ssh, a.mosh_client) = (false, false),
+            "--mosh-client" => (a.ssh, a.mosh_client) = (false, true),
             "--no-tui-prediction" => a.tui_prediction = false,
+            "--no-shell-prediction" => a.shell_prediction = false,
             "--shell" => a.shell = Some(val(&mut it)),
             "--print-hooks" => {
                 // debugging aid: tns --print-hooks bash osc
@@ -129,6 +139,11 @@ fn term_size() -> (usize, usize) {
 static RESIZED: AtomicBool = AtomicBool::new(false);
 extern "C" fn on_winch(_: libc::c_int) {
     RESIZED.store(true, Ordering::Relaxed);
+}
+
+static QUIT: AtomicBool = AtomicBool::new(false);
+extern "C" fn on_quit(_: libc::c_int) {
+    QUIT.store(true, Ordering::Relaxed);
 }
 
 struct RawMode {
@@ -273,6 +288,7 @@ struct Inflight {
     expected: Option<Key>, // state hash the confirmed screen should reach
     has_snap: bool,
     seen: bool,
+    num: u64, // native mosh: our input state that carries the key
 }
 
 impl Inflight {
@@ -467,13 +483,44 @@ struct Client {
     prompt_anchor: PromptAnchor,
     terminal_input: TerminalInput,
     tui: tui::Predictor,
+    shell_preview: tui::Predictor,
     last_out: Option<Instant>,
     rtt: f64,
     probes_started: bool,
     last_save: Instant,
+    // Native mosh transport only.
+    echo: echo::Predictor,
+    echo_ack: u64,  // our newest input state the server reports as echoed
+    shown_num: u64, // the server state on screen
+    escape: bool,   // Ctrl-^ was typed; the next key completes the command
+    notice: Option<String>,
+    started: Instant,
 }
 
+/// What mosh-client sends on exit: leave application cursor keys, mouse
+/// reporting and the other modes a remote program may have set, then return
+/// to the terminal's own screen.
+const NATIVE_CLOSE: &[u8] = b"\x1b[?1l\x1b[0m\x1b[?25h\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\x1b[?1015l\x1b[?1006l\x1b[?1005l\x1b[?2004l\x1b[?1004l\x1b[?1007l\x1b[?5l\x1b[?1049l";
+const NO_CONTACT: Duration = Duration::from_millis(6500);
+
 impl Client {
+    fn native(&self) -> bool {
+        matches!(self.sess.link, Link::Mosh(_))
+    }
+
+    /// The native transport validates literal previews with the server's
+    /// echo acknowledgments instead (see `echo`).
+    fn shell_preview_enabled(&self) -> bool {
+        self.args.shell_prediction && self.shared.shell.has_hooks() && !self.native()
+    }
+
+    /// A native session's screen model is resized by the server's frames;
+    /// until then it does not describe the real terminal.
+    fn in_sync(&self) -> bool {
+        let g = &self.sess.em.screen.grid;
+        (g.cols, g.rows) == (self.sess.cols, self.sess.rows)
+    }
+
     fn log(&self, msg: &str) {
         self.shared.log(msg);
     }
@@ -552,13 +599,18 @@ impl Client {
         let conf = &self.sess.em.screen.grid;
         let mut w = RunWriter::new(&mut self.out);
         for &(y, x) in &self.overlay {
-            let (y, x) = (y as usize, x as usize);
+            let (y, mut x) = (y as usize, x as usize);
             if y < conf.rows && x < conf.cols {
+                // The right half of a wide character is drawn by its left half.
+                if conf.row(y)[x].ch == 0 && x > 0 {
+                    x -= 1;
+                }
                 w.cell(y, x, &conf.row(y)[x]);
             }
         }
         w.finish();
         cup(&mut self.out, conf.cy, conf.cx);
+        sgr(&mut self.out, &self.sess.em.screen.attrs());
         self.overlay.clear();
         self.overlay_cursor = false;
     }
@@ -598,6 +650,8 @@ impl Client {
             }
             match ev {
                 Event::Prompt => {
+                    self.shell_preview.restore(&self.sess.em.screen, &mut self.out);
+                    self.shell_preview.reset();
                     self.tui.restore(&self.sess.em.screen, &mut self.out);
                     self.tui.reset();
                     let now = if in_band { self.last_out.unwrap_or_else(Instant::now) } else { Instant::now() };
@@ -646,23 +700,258 @@ impl Client {
     }
 
     fn anchor_deadline(&self) -> Option<Instant> {
-        if !self.prompt_anchor.pending || !self.terminal_input.pending.is_empty() || self.sess.em.screen.alt || !self.sess.em.screen.grid.cells.iter().any(|c| *c != Grid::BLANK_CELL) {
+        if !self.prompt_anchor.pending || !self.terminal_input.pending.is_empty() || self.sess.em.screen.alt || !self.in_sync() || !self.sess.em.screen.grid.cells.iter().any(|c| *c != Grid::BLANK_CELL) {
             return None;
         }
-        let quiet = Duration::from_millis(if !self.shared.shell.has_hooks() { 250 } else if !self.args.ssh { 120 } else { 40 });
+        let mut quiet = Duration::from_millis(if !self.shared.shell.has_hooks() { 250 } else if !self.args.ssh { 120 } else { 40 });
+        if self.native() {
+            // mosh-server paces its frames at half the round trip (20-250 ms):
+            // a prompt still being drawn arrives one such interval later.
+            quiet = quiet.max(Duration::from_secs_f64((self.rtt / 2.0).clamp(0.02, 0.25) + 0.04));
+        }
         self.prompt_anchor.deadline(self.last_out, quiet)
+    }
+
+    /// A lone key waiting to be learned on the native transport, before the
+    /// server has said the screen includes its echo.
+    fn unacked_single(&self) -> Option<&Inflight> {
+        let e = self.inflight.front().filter(|_| self.native() && self.inflight.len() == 1)?;
+        (e.expected.is_none() && e.has_snap && self.echo_ack < e.num).then_some(e)
     }
 
     fn inflight_deadline(&self) -> Option<Instant> {
         if !self.anchor_valid || self.sess.em.screen.alt {
             return None;
         }
-        inflight_deadline(&self.inflight, self.last_out, self.rtt)
+        let deadline = inflight_deadline(&self.inflight, self.last_out, self.rtt)?;
+        // Quiet output is not yet the key's result; give the acknowledgment
+        // the grace a burst gets, then give up on learning it.
+        Some(self.unacked_single().map_or(deadline, |e| deadline.max(e.t + Duration::from_secs_f64(0.35f64.max(3.0 * self.rtt)))))
+    }
+
+    /// Draw the literal echo previews; the cursor ends on the newest prediction.
+    fn paint_echo(&mut self) {
+        let conf = &self.sess.em.screen.grid;
+        let cursor = if self.pred_active { (self.pred.cy, self.pred.cx) } else { (conf.cy, conf.cx) };
+        self.echo.paint(&self.sess.em.screen, &mut self.out, cursor);
+    }
+
+    /// Offer a key to the echo predictor (native transport).
+    fn echo_key(&mut self, unit: &[u8], num: u64, anchor: Option<Anchor>, preview: bool, enabled: bool) {
+        if !enabled || !self.in_sync() {
+            self.echo.untracked(num);
+        } else if self.echo.input(unit, num, &self.sess.em.screen, self.echo_ack, echo::Context { anchor, preview }) {
+            self.log("echo preview");
+        }
+        self.paint_echo();
+        self.flush();
+    }
+
+    /// The server's frame resized the screen model (native transport).
+    fn model_resized(&mut self, cols: usize, rows: usize) {
+        self.sess.em.resize(cols, rows);
+        self.pred.resize(cols, rows);
+        self.snap.resize(cols, rows);
+        self.clear_prediction();
+        self.overlay.clear();
+        self.overlay_cursor = false;
+        self.anchor_valid = false;
+        self.prompt_anchor.resize(Instant::now());
+        self.echo.reset();
+    }
+
+    /// Take every local preview off the terminal: remote output is relative
+    /// to the real cursor and attributes.
+    fn before_output(&mut self) {
+        self.restore_notice();
+        self.echo.restore(&self.sess.em.screen, &mut self.out);
+        self.shell_preview.restore(&self.sess.em.screen, &mut self.out);
+        self.restore_overlay();
+        self.tui.restore(&self.sess.em.screen, &mut self.out);
+    }
+
+    /// Pass remote bytes to the terminal and the screen model.
+    fn feed_output(&mut self, data: &[u8]) {
+        let Client { sess, out, terminal_input, tui, shell_preview, .. } = self;
+        terminal_input.output(data);
+        tui.output(data);
+        shell_preview.output(data);
+        sess.em.feed(data, out);
+        let now = Instant::now();
+        self.last_out = Some(now);
+        if self.inflight.len() == 1 && !self.inflight[0].seen {
+            self.inflight[0].seen = true;
+            let t = self.inflight[0].t;
+            self.rtt = 0.8 * self.rtt + 0.2 * now.duration_since(t).as_secs_f64();
+        }
+    }
+
+    /// Reconcile predictions with the new confirmed screen and repaint them.
+    fn after_output(&mut self) {
+        if let Some(cwd) = self.sess.em.cwd.as_ref() {
+            let mut g = self.shared.cwd.lock().unwrap();
+            if g.as_deref() != Some(cwd.as_str()) {
+                *g = Some(cwd.clone());
+            }
+        }
+        self.handle_events(true);
+        let native = self.native();
+        if self.args.tui_prediction && !native {
+            self.tui.observe(&self.sess.em.screen);
+            if self.tui.active() {
+                // An application's composer is not a shell prompt.
+                self.anchor_valid = false;
+                self.prompt_anchor.pending = false;
+                self.clear_prediction();
+                self.shell_preview.reset();
+            }
+        }
+        if self.anchor_valid && self.shell_preview_enabled() {
+            self.shell_preview.observe_shell(&self.sess.em.screen, self.anchor);
+        }
+        if self.anchor_valid && !self.inflight.is_empty() && !self.sess.em.screen.alt {
+            let k = self.key_of(&self.sess.em.screen.grid);
+            if let Some(i) = self.inflight.iter().position(|e| e.expected == Some(k)) {
+                self.inflight.drain(..=i);
+                self.shared.with_stats(|s| s.hit += i as u64 + 1);
+            }
+            self.rebuild_pred();
+        }
+        self.paint_overlay();
+        self.shell_preview.paint(&self.sess.em.screen, &mut self.out);
+        self.tui.paint(&self.sess.em.screen, &mut self.out);
+        if native {
+            self.paint_echo();
+        }
+        self.flush();
+    }
+
+    /// Read the native transport and show the server's newest screen state.
+    /// The server sends states, not a byte stream: its diffs build on
+    /// whichever state we last acknowledged, so the terminal is always
+    /// updated from the difference between two screen models.
+    fn native_receive(&mut self) {
+        let Some(m) = self.sess.mosh() else { return };
+        m.recv(Instant::now());
+        let rtt = m.rtt_known().then(|| m.srtt());
+        let latest = m.latest();
+        let (num, echo_ack) = (latest.num, latest.echo_ack);
+        let screen = (num != self.shown_num).then(|| latest.screen.clone());
+        if let Some(rtt) = rtt {
+            self.rtt = rtt;
+        }
+        let Some(screen) = screen else { return };
+        self.before_output();
+        let shown = &self.sess.em.screen;
+        let (cols, rows) = (screen.grid.cols, screen.grid.rows);
+        let resized = (cols, rows) != (shown.grid.cols, shown.grid.rows);
+        // A state may carry nothing but a newer echo acknowledgment.
+        let changed = resized || shown.grid.cells != screen.grid.cells || (shown.grid.cy, shown.grid.cx) != (screen.grid.cy, screen.grid.cx);
+        repaint(shown, &screen, &mut self.out);
+        if resized {
+            self.model_resized(cols, rows);
+        }
+        self.sess.em.screen = screen;
+        if changed {
+            // Not the time of the read: a resize above restarted the clock
+            // that output is measured against.
+            self.last_out = Some(Instant::now());
+        }
+        self.shown_num = num;
+        self.echo_ack = echo_ack;
+        self.echo.frame(&self.sess.em.screen, echo_ack, changed);
+        self.after_output();
+    }
+
+    /// mosh's escape key: Ctrl-^ then "." quits, and Ctrl-^ twice (or
+    /// Ctrl-^ ^) sends one Ctrl-^.  Returns false when the user quit.
+    fn escape_keys(&mut self, data: &mut Vec<u8>) -> bool {
+        let mut keys = Vec::with_capacity(data.len());
+        for &b in data.iter() {
+            if std::mem::take(&mut self.escape) {
+                match b {
+                    b'.' => return false,
+                    0x1e | b'^' => keys.push(0x1e),
+                    _ => keys.extend([0x1e, b]),
+                }
+            } else if b == 0x1e {
+                self.escape = true;
+            } else {
+                keys.push(b);
+            }
+        }
+        *data = keys;
+        true
+    }
+
+    /// The first screen row is borrowed for a notice while the server is silent.
+    fn update_notice(&mut self) {
+        let Link::Mosh(m) = &self.sess.link else { return };
+        let now = Instant::now();
+        let text = match m.silence(now) {
+            None if now.duration_since(self.started) > Duration::from_secs(2) => Some("tns: no reply from the mosh server yet (is its UDP port reachable?). To quit: Ctrl-^ .".to_string()),
+            Some(silence) if silence > NO_CONTACT => Some(format!("tns: last contact {} s ago. To quit: Ctrl-^ .", silence.as_secs())),
+            _ => None,
+        };
+        if text == self.notice {
+            return;
+        }
+        self.restore_notice();
+        if let Some(text) = &text {
+            let width = self.sess.cols;
+            let line: String = text.chars().chain(std::iter::repeat(' ')).take(width).collect();
+            // DECSC/DECRC keep the cursor and attributes the remote expects.
+            self.out.extend_from_slice(b"\x1b7\x1b[1;1H\x1b[0;7m");
+            self.out.extend_from_slice(line.as_bytes());
+            self.out.extend_from_slice(b"\x1b8");
+        }
+        self.notice = text;
+        self.flush();
+    }
+
+    fn restore_notice(&mut self) {
+        if self.notice.take().is_none() {
+            return;
+        }
+        let g = &self.sess.em.screen.grid;
+        self.out.extend_from_slice(b"\x1b7\x1b[1;1H\x1b[0m\x1b[K");
+        let mut w = RunWriter::new(&mut self.out);
+        for (x, cell) in g.row(0).iter().enumerate().take(self.sess.cols) {
+            w.cell(0, x, cell);
+        }
+        w.finish();
+        self.out.extend_from_slice(b"\x1b8");
+    }
+
+    /// End a native session we are leaving first, so the remote shell does
+    /// not outlive this client.
+    fn native_shutdown(&mut self) {
+        let Some(m) = self.sess.mosh() else { return };
+        if m.peer_closed() || !m.connected() {
+            return;
+        }
+        m.close(Instant::now());
+        let give_up = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < give_up && !m.closed() {
+            poll_read(&[m.fd()], 20);
+            let now = Instant::now();
+            m.recv(now);
+            m.tick(now);
+        }
     }
 
     fn run(&mut self) {
         unsafe {
             libc::signal(libc::SIGWINCH, on_winch as extern "C" fn(libc::c_int) as usize);
+        }
+        if self.native() {
+            unsafe {
+                libc::signal(libc::SIGHUP, on_quit as extern "C" fn(libc::c_int) as usize);
+                libc::signal(libc::SIGTERM, on_quit as extern "C" fn(libc::c_int) as usize);
+            }
+            // As mosh-client does: a screen of our own, and application
+            // cursor keys, which the server translates for each program.
+            self.out.extend_from_slice(b"\x1b[?1049h\x1b[?1h\x1b[0m");
         }
         self.out.extend_from_slice(b"\x1b[H\x1b[2J");
         self.flush();
@@ -670,9 +959,13 @@ impl Client {
 
         loop {
             let now = Instant::now();
-            let timeout = poll_timeout_ms(now, self.inflight_deadline().into_iter().chain(self.anchor_deadline()).chain(self.tui.deadline(self.rtt)));
+            let transport = match &self.sess.link {
+                Link::Mosh(m) => m.deadline(now),
+                Link::Pty(_) => None,
+            };
+            let timeout = poll_timeout_ms(now, self.inflight_deadline().into_iter().chain(self.anchor_deadline()).chain(self.tui.deadline(self.rtt)).chain(self.shell_preview.deadline(self.rtt)).chain(transport));
             let wake = self.chan.as_ref().map_or(-1, |c| c.wake_fd);
-            let ready = poll_read(&[0, self.sess.pty.fd, wake], timeout);
+            let ready = poll_read(&[0, self.sess.fd(), wake], timeout);
 
             if ready[2] {
                 if let Some(c) = &self.chan {
@@ -686,61 +979,42 @@ impl Client {
                 let (cols, rows) = term_size();
                 *self.shared.size.lock().unwrap() = (cols, rows);
                 self.sess.resize(cols, rows);
-                self.pred.resize(cols, rows);
-                self.snap.resize(cols, rows);
+                if !self.native() {
+                    self.pred.resize(cols, rows);
+                    self.snap.resize(cols, rows);
+                }
                 self.clear_prediction();
                 self.overlay.clear();
                 self.overlay_cursor = false;
                 self.anchor_valid = false;
                 self.prompt_anchor.resize(Instant::now());
                 self.tui.reset();
+                self.shell_preview.reset();
+                self.echo.reset();
+                self.notice = None;
+                if self.native() && self.in_sync() {
+                    // Nothing else redraws a native session whose size is
+                    // what it was (a spurious signal, or there and back):
+                    // the server only sends what differs from its last state.
+                    redraw(&self.sess.em.screen, &mut self.out);
+                    self.flush();
+                }
             }
 
             if ready[1] {
-                let n = self.sess.pty.read(&mut self.buf);
-                if n == 0 {
-                    break;
-                }
-                self.restore_overlay();
-                self.tui.restore(&self.sess.em.screen, &mut self.out);
-                let Client { sess, buf, out, terminal_input, tui, .. } = self;
-                terminal_input.output(&buf[..n]);
-                tui.output(&buf[..n]);
-                sess.em.feed(&buf[..n], out);
-                let now = Instant::now();
-                self.last_out = Some(now);
-                if self.inflight.len() == 1 && !self.inflight[0].seen {
-                    self.inflight[0].seen = true;
-                    let t = self.inflight[0].t;
-                    self.rtt = 0.8 * self.rtt + 0.2 * now.duration_since(t).as_secs_f64();
-                }
-                if let Some(cwd) = self.sess.em.cwd.as_ref() {
-                    let mut g = self.shared.cwd.lock().unwrap();
-                    if g.as_deref() != Some(cwd.as_str()) {
-                        *g = Some(cwd.clone());
+                if self.native() {
+                    self.native_receive();
+                } else {
+                    let n = self.sess.read(&mut self.buf);
+                    if n == 0 {
+                        break;
                     }
+                    let buf = std::mem::take(&mut self.buf);
+                    self.before_output();
+                    self.feed_output(&buf[..n]);
+                    self.after_output();
+                    self.buf = buf;
                 }
-                self.handle_events(true);
-                if self.args.tui_prediction {
-                    self.tui.observe(&self.sess.em.screen);
-                    if self.tui.active() {
-                        // An application's composer is not a shell prompt.
-                        self.anchor_valid = false;
-                        self.prompt_anchor.pending = false;
-                        self.clear_prediction();
-                    }
-                }
-                if self.anchor_valid && !self.inflight.is_empty() && !self.sess.em.screen.alt {
-                    let k = self.key_of(&self.sess.em.screen.grid);
-                    if let Some(i) = self.inflight.iter().position(|e| e.expected == Some(k)) {
-                        self.inflight.drain(..=i);
-                        self.shared.with_stats(|s| s.hit += i as u64 + 1);
-                    }
-                    self.rebuild_pred();
-                }
-                self.paint_overlay();
-                self.tui.paint(&self.sess.em.screen, &mut self.out);
-                self.flush();
             }
 
             if ready[0] {
@@ -749,10 +1023,14 @@ impl Client {
                     break;
                 }
                 let n = n as usize;
-                let data: Vec<u8> = self.buf[..n].to_vec();
+                let mut data: Vec<u8> = self.buf[..n].to_vec();
+                let native = self.native();
+                if native && !self.escape_keys(&mut data) {
+                    break;
+                }
                 // Split short printable input into per-character units.
-                let mut units: Vec<&[u8]> = vec![&data[..]];
-                if n <= 6 {
+                let mut units: Vec<&[u8]> = if data.is_empty() { Vec::new() } else { vec![&data[..]] };
+                if data.len() <= 6 {
                     if let Ok(s) = std::str::from_utf8(&data) {
                         if s.chars().all(|c| c as u32 >= 32 && c != '\x7f') {
                             units = s.char_indices().map(|(i, c)| &data[i..i + c.len_utf8()]).collect();
@@ -760,9 +1038,17 @@ impl Client {
                     }
                 }
                 for unit in units {
-                    if self.sess.pty.write(unit).is_err() {
-                        break;
-                    }
+                    // The native transport numbers the input state that
+                    // carries each key; the server acknowledges by number.
+                    let num = match &mut self.sess.link {
+                        Link::Pty(pty) => {
+                            if pty.write(unit).is_err() {
+                                break;
+                            }
+                            0
+                        }
+                        Link::Mosh(m) => m.push_keys(unit, Instant::now()),
+                    };
                     // Output processed earlier in this poll turn must not
                     // count as a response to input we have only just sent.
                     let now = Instant::now();
@@ -779,7 +1065,10 @@ impl Client {
                     }
                     self.tui.paint(&self.sess.em.screen, &mut self.out);
                     self.flush();
+                    self.shell_preview.restore(&self.sess.em.screen, &mut self.out);
                     if matches!(unit, b"\r" | b"\n" | b"\x03" | b"\x04" | b"\x0c") {
+                        self.shell_preview.reset();
+                        self.echo.untracked(num);
                         self.shared.with_stats(|s| s.keys += 1);
                         self.restore_overlay();
                         // Never reuse output from before this command/reset
@@ -799,6 +1088,9 @@ impl Client {
                         }
                         self.clear_prediction();
                         self.anchor_valid = false;
+                        if native {
+                            self.paint_echo();
+                        }
                         self.flush();
                         continue;
                     }
@@ -806,10 +1098,21 @@ impl Client {
                         self.prompt_anchor.input();
                     }
                     if activity.protocol {
+                        if activity.user || !self.terminal_input.pending.is_empty() {
+                            self.shell_preview.cancel();
+                        }
+                        self.echo.untracked(num);
+                        self.shell_preview.paint(&self.sess.em.screen, &mut self.out);
+                        self.flush();
                         continue;
                     }
                     self.shared.with_stats(|s| s.keys += 1);
                     if !self.anchor_valid || self.sess.em.screen.alt {
+                        self.shell_preview.cancel();
+                        if native {
+                            self.echo_key(unit, num, None, true, self.args.tui_prediction);
+                        }
+                        self.flush();
                         continue;
                     }
                     let pre_key = if self.pred_active { self.key_of(&self.pred) } else { self.key_of(&self.sess.em.screen.grid) };
@@ -817,7 +1120,7 @@ impl Client {
                     if learnable {
                         self.snap.copy_rows_from(&self.sess.em.screen.grid, self.anchor.0);
                     }
-                    let mut e = Inflight { unit: [0; 8], ulen: unit.len().min(8) as u8, pre_key, t: now, val: None, expected: None, has_snap: learnable, seen: false };
+                    let mut e = Inflight { unit: [0; 8], ulen: unit.len().min(8) as u8, pre_key, t: now, val: None, expected: None, has_snap: learnable, seen: false, num };
                     e.unit[..e.ulen as usize].copy_from_slice(&unit[..e.ulen as usize]);
                     let chain_ok = self.inflight.iter().all(|x| x.val.is_some());
                     let mut predicted = false;
@@ -843,11 +1146,30 @@ impl Client {
                         self.shared.with_stats(|s| s.unpredicted += 1);
                     }
                     self.inflight.push_back(e);
+                    if self.shell_preview_enabled() {
+                        if self.shell_preview.input_with_preview(unit, now, !predicted) {
+                            self.log("shell literal edit preview");
+                        }
+                        self.shell_preview.paint(&self.sess.em.screen, &mut self.out);
+                        self.flush();
+                    }
+                    if native {
+                        // Only a prompt the shell itself reported is a
+                        // prompt; without hooks it is a quiet screen.
+                        let anchor = self.shared.shell.has_hooks().then_some(self.anchor);
+                        self.echo_key(unit, num, anchor, !predicted, self.args.shell_prediction);
+                    }
                 }
             }
 
             // ---- timers: quiescence
             let now = Instant::now();
+            if self.shell_preview.deadline(self.rtt).is_some_and(|t| now >= t) {
+                self.shell_preview.restore(&self.sess.em.screen, &mut self.out);
+                self.shell_preview.cancel();
+                self.log("shell preview expired without a matching remote field");
+                self.flush();
+            }
             if self.tui.deadline(self.rtt).is_some_and(|t| now >= t) {
                 self.tui.restore(&self.sess.em.screen, &mut self.out);
                 self.tui.cancel();
@@ -861,6 +1183,12 @@ impl Client {
                 let g = &self.sess.em.screen.grid;
                 self.anchor = (g.cy, g.cx);
                 self.anchor_valid = true;
+                if self.shared.shell.has_hooks() {
+                    self.echo.prompt(&self.sess.em.screen, self.anchor);
+                }
+                if self.shell_preview_enabled() {
+                    self.shell_preview.observe_shell(&self.sess.em.screen, self.anchor);
+                }
                 let cwd = self.sess.em.cwd.clone();
                 self.log(&format!("anchor={:?} cwd={:?}", self.anchor, cwd));
                 if !self.probes_started && !self.shared.shell.has_hooks() {
@@ -870,26 +1198,49 @@ impl Client {
             }
             if self.inflight_deadline().is_some_and(|t| now >= t) {
                 let single = self.inflight.len() == 1;
+                let unacked = self.unacked_single().is_some();
                 let e = self.inflight.pop_front().unwrap();
                 if e.expected.is_some() {
                     // Predicted, but the confirmed screen never matched.
                     self.shared.with_stats(|s| s.miss += 1);
                     self.log(&format!("miss unit={:?}", e.unit_str()));
                 }
-                if single && e.has_snap {
+                if single && e.has_snap && !unacked {
                     self.learn(&e);
                 }
                 self.clear_prediction();
                 self.restore_overlay();
+                self.shell_preview.paint(&self.sess.em.screen, &mut self.out);
+                if self.native() {
+                    self.paint_echo();
+                }
                 self.flush();
             }
             if t_start.elapsed() > Duration::from_secs(5) && self.last_save.elapsed() > Duration::from_secs(15) {
                 self.last_save = Instant::now();
                 let _ = self.shared.cache.lock().unwrap().save();
             }
+
+            // ---- native transport: send what is due, notice silence, leave
+            if let Some(m) = self.sess.mosh() {
+                if QUIT.load(Ordering::Relaxed) {
+                    break;
+                }
+                m.tick(Instant::now());
+                if m.peer_closed() {
+                    break;
+                }
+                self.update_notice();
+            }
         }
+        self.shell_preview.restore(&self.sess.em.screen, &mut self.out);
+        self.shell_preview.cancel();
         self.tui.restore(&self.sess.em.screen, &mut self.out);
         self.tui.cancel();
+        if self.native() {
+            self.native_shutdown();
+            self.out.extend_from_slice(NATIVE_CLOSE);
+        }
         self.flush();
     }
 }
@@ -986,7 +1337,7 @@ fn main() {
     let logf: Option<File> = if args.debug { OpenOptions::new().create(true).append(true).open(dir.join("debug.log")).ok() } else { None };
     let size = term_size();
     let session_id = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
-    let transport = if args.ssh { Transport::Ssh } else { Transport::Mosh };
+    let transport = if args.ssh { Transport::Ssh } else if args.mosh_client { Transport::MoshClient } else { Transport::Mosh };
     let shell_path = match &args.shell {
         Some(s) => s.clone(),
         None => match remote::detect_shell(&args.host) {
@@ -1009,7 +1360,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    if transport == Transport::Mosh && !info.mosh_server {
+    if transport != Transport::Ssh && !info.mosh_server {
         eprintln!("tns: mosh-server is not installed on {}. Run `tns setup {}` for installation instructions, or use `tns --ssh {}`.", args.host, args.host, args.host);
         remote::cleanup(&args.host, &session_id);
         std::process::exit(1);
@@ -1029,15 +1380,16 @@ fn main() {
         t0: Instant::now(),
     });
     let event_path = remote::event_file(&session_id);
-    let sink = if transport == Transport::Mosh { Sink::File(event_path.clone()) } else { Sink::Osc };
+    let sink = if transport == Transport::Ssh { Sink::Osc } else { Sink::File(event_path.clone()) };
     let sess = match Session::open(&args.host, size.0, size.1, transport, &session_id, &sink, None) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("tns: cannot start {}: {}", if args.ssh { "ssh" } else { "mosh" }, e);
+            remote::cleanup(&args.host, &session_id);
             std::process::exit(1);
         }
     };
-    let chan = if transport == Transport::Mosh {
+    let chan = if transport != Transport::Ssh {
         match EventChannel::start(&args.host, &event_path) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -1068,10 +1420,17 @@ fn main() {
         prompt_anchor: PromptAnchor::new(Instant::now(), shell.has_hooks()),
         terminal_input: TerminalInput::default(),
         tui: tui::Predictor::default(),
+        shell_preview: tui::Predictor::default(),
         last_out: None,
         rtt: 0.08,
         probes_started: false,
         last_save: Instant::now(),
+        echo: echo::Predictor::default(),
+        echo_ack: 0,
+        shown_num: 0,
+        escape: false,
+        notice: None,
+        started: Instant::now(),
     };
     client.run();
     shared.stop();
@@ -1086,7 +1445,7 @@ fn main() {
     let cache = shared.cache.lock().unwrap();
     let _ = writeln!(
         io::stdout(),
-        "tns: {} keys, {} predicted ({} confirmed, {} mispredicted), {} unpredicted, learned {} live + {} from {} probes, cache {} entries (~{} KB), rtt ~{:.0} ms; TUI {} previewed ({} matched, {} discarded)",
+        "tns: {} keys, {} predicted ({} confirmed, {} mispredicted), {} unpredicted, learned {} live + {} from {} probes, cache {} entries (~{} KB), rtt ~{:.0} ms; {}",
         s.keys,
         s.predicted,
         s.hit,
@@ -1098,9 +1457,14 @@ fn main() {
         cache.len(),
         cache.mem_bytes() / 1024,
         client.rtt * 1000.0,
-        client.tui.predicted,
-        client.tui.confirmed,
-        client.tui.discarded
+        if client.native() {
+            format!("echo {} previewed ({} matched, {} discarded)", client.echo.predicted, client.echo.confirmed, client.echo.discarded)
+        } else {
+            format!(
+                "TUI {} previewed ({} matched, {} discarded); shell {} previewed ({} matched, {} discarded)",
+                client.tui.predicted, client.tui.confirmed, client.tui.discarded, client.shell_preview.predicted, client.shell_preview.confirmed, client.shell_preview.discarded
+            )
+        }
     );
     drop(cache);
     drop(client);
@@ -1111,7 +1475,7 @@ mod client_regressions {
     use super::*;
 
     fn key(t: Instant, has_snap: bool, expected: Option<Key>) -> Inflight {
-        Inflight { unit: [b'a'; 8], ulen: 1, pre_key: 0, t, val: expected, expected, has_snap, seen: false }
+        Inflight { unit: [b'a'; 8], ulen: 1, pre_key: 0, t, val: expected, expected, has_snap, seen: false, num: 0 }
     }
 
     #[test]

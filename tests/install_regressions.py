@@ -40,12 +40,12 @@ elif name in ('brew', 'apt-get', 'cargo', 'sudo'):
             p.chmod(0o755)
     if name == 'brew' and any('tns' in arg for arg in args):
         p=root/'bin/tns'
-        p.write_text('#!/bin/sh\necho \"tns 0.6.1\"\n')
+        p.write_text('#!/bin/sh\necho \"tns 0.7.0\"\n')
         p.chmod(0o755)
     if name == 'cargo':
         p=Path(args[args.index('--root')+1])/'bin/tns'
         p.parent.mkdir(parents=True,exist_ok=True)
-        p.write_text('#!/bin/sh\necho \"tns 0.6.1\"\n')
+        p.write_text('#!/bin/sh\necho \"tns 0.7.0\"\n')
         p.chmod(0o755)
 else:
     raise SystemExit(0)
@@ -147,7 +147,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         cargo = next(call for call in self.calls() if call[0] == "cargo")
         self.assertIn("--locked", cargo)
-        self.assertEqual(cargo[cargo.index("--tag")+1], "v0.6.1")
+        self.assertEqual(cargo[cargo.index("--tag")+1], "v0.7.0")
         self.assertIn("Remote machine: not checked", r.stdout)
 
     def test_missing_cargo_path_is_an_actionable_failure(self):

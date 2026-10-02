@@ -1,13 +1,14 @@
 # tns
 
 tns is a remote terminal for macOS and Linux. It connects to an existing SSH
-host, uses mosh for the interactive session, and previews supported typing
-locally to reduce visible input delay. Your shell, files, and tools stay on
-the remote machine.
+host, carries the interactive session over mosh's protocol, and previews
+typing locally to reduce visible input delay. Your shell, files, and tools
+stay on the remote machine.
 
-It works with bash, zsh, and fish. It also has experimental typing previews
-for Claude Code's existing single-line composer. You do not need a replacement
-interface or a `tns agent` command to use Claude inside a session.
+It works with bash, zsh, and fish, and previews typing inside terminal
+applications such as Claude Code once they are seen echoing it. You do not
+need a replacement interface or a `tns agent` command to use Claude inside a
+session.
 
 ## What goes on each machine
 
@@ -15,7 +16,7 @@ interface or a `tns agent` command to use Claude inside a session.
 |---|---|---|
 | tns | Install here | Not required |
 | SSH | Client and working key authentication | SSH server and your authorized key |
-| mosh | `mosh` client | `mosh-server` (from the `mosh` package) |
+| mosh | Not required: tns has its own mosh client | `mosh-server` (from the `mosh` package) |
 | Locale | UTF-8 | An available UTF-8 locale |
 | Claude and other tools | Not required locally | Install and sign in here, if you use them |
 | Rust | Only for building tns; Homebrew handles its build dependency | Not required |
@@ -30,7 +31,7 @@ On macOS, or Linux with Homebrew:
 brew install wrsrsh/tap/tns
 ```
 
-This also installs mosh. Linux without Homebrew has a
+Linux without Homebrew has a
 [documented source-install path](docs/setup.md#linux-without-homebrew).
 
 ### 2. On your remote machine: install mosh
@@ -96,13 +97,21 @@ for download commands, prerequisites, manual installation, and troubleshooting.
 
 ## Using SSH instead of mosh
 
-Mosh is the default; no extra command or flag is needed. If UDP is unavailable,
-select plain SSH explicitly:
+Mosh is the default; no extra command or flag is needed. tns talks to the
+remote `mosh-server` itself, so it sees which keystrokes the server has
+answered. If UDP is unavailable, select plain SSH explicitly:
 
 ```sh
 tns setup --ssh user@server
 tns --ssh user@server
 ```
+
+`tns --mosh-client user@server` runs the separate `mosh` program underneath
+instead, as tns did before it had its own client. That needs mosh installed
+locally and predicts less.
+
+In a mosh session, `Ctrl-^ .` quits tns, for instance when the server cannot
+be reached; `Ctrl-^ ^` sends a literal `Ctrl-^`.
 
 ## Updating
 
@@ -118,16 +127,35 @@ remote mosh and your tools are managed with their own package managers.
 
 ## What to expect
 
-Shell predictions improve as tns learns the shell's redraws. The initial
-calibration uses background SSH sessions and recent shell history; it does
+Cached shell predictions improve as tns learns the shell's redraws: they
+include syntax colors and autosuggestions. When the cache misses, tns draws
+the typed character itself, as mosh does, and lets the remote output replace
+it. The mosh server reports which keystrokes it has answered, so a wrong
+guess is withdrawn rather than left on screen.
+
+These previews appear once the program you are typing into has been seen
+echoing: after the first character of a line, and from the first character
+at a shell prompt that reads like one that has echoed before. A password
+prompt does not echo, so what you type into it is not drawn. As with mosh,
+the exception is a program that stops echoing partway through a line: keys
+already on their way can show for a moment, until the server's answer
+withdraws them. Backspace and the left and right arrow keys are previewed
+too. `--no-shell-prediction` turns the previews off at shell prompts and
+`--no-tui-prediction` inside applications.
+
+With `--ssh` or `--mosh-client` there are no acknowledgments to rely on, and
+the previews are limited to plain typing at a shell prompt and in Claude
+Code's composer.
+
+The initial calibration uses background SSH sessions and recent shell history; it does
 not submit commands. Use `--probes 0 --history 0` to turn off background
 calibration. The local cache can contain terminal text, so treat it like shell
 history.
 
 Predictions are previews, not changes to the remote application. Unrecognized
-input waits for the remote. Claude support is deliberately limited; it does
-not speed up model inference or predict permission decisions. See
-[the supported behavior and limits](docs/in-session-prediction.md).
+input waits for the remote. Nothing speeds up model inference or predicts
+permission decisions. See [how tns compares with mosh](docs/benchmarks.md)
+and [the supported behavior and limits](docs/in-session-prediction.md).
 
 ## Documentation and development
 

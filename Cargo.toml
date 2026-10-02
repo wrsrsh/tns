@@ -1,6 +1,6 @@
 [package]
 name = "tns"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 description = "Remote terminal with local typing prediction over SSH or mosh"
 license = "MIT"
@@ -19,6 +19,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ratatui = "0.30"
 crossterm = "0.29"
+ocb3 = { version = "0.2", default-features = false, features = ["alloc"] }
+aes = "0.9"
+miniz_oxide = "0.9"
 
 [profile.release]
 opt-level = 3

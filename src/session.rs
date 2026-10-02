@@ -6,8 +6,9 @@ use std::io::{self, BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::mosh;
 use crate::remote::{launch_argv, Sink};
 use crate::term::Screen;
 
@@ -302,12 +303,21 @@ impl Drop for Pty {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Transport {
     Ssh,
+    /// tns's own client for a remote mosh-server.
     Mosh,
+    /// The original path: mosh-client in a pty.
+    MoshClient,
+}
+
+/// What carries the session's bytes.
+pub enum Link {
+    Pty(Pty),
+    Mosh(Box<mosh::Client>),
 }
 
 /// A session to `host` running the hooked shell prepared by `remote`.
 pub struct Session {
-    pub pty: Pty,
+    pub link: Link,
     pub em: Emulator,
     pub cols: usize,
     pub rows: usize,
@@ -342,6 +352,17 @@ impl Session {
                 v
             }
             Transport::Mosh => {
+                let endpoint = mosh::start_server(host, &launch)?;
+                let now = Instant::now();
+                let mut client = mosh::Client::connect(endpoint.addr, &endpoint.key, now)?;
+                client.push_resize(cols, rows, now);
+                // Both ends start from an empty 80x24 screen; the server's
+                // first frame resizes ours to the real terminal.
+                let mut em = Emulator::new(80, 24);
+                em.screen.track_alt = false; // mosh has no alternate screen
+                return Ok(Session { link: Link::Mosh(Box::new(client)), em, cols, rows });
+            }
+            Transport::MoshClient => {
                 let ssh = ssh_base(host);
                 let mut v = vec!["mosh".to_string(), "--predict=never".into(), format!("--ssh={}", ssh[..ssh.len() - 1].join(" ")), host.into(), "--".into()];
                 v.extend(launch);
@@ -350,17 +371,56 @@ impl Session {
         };
         let pty = Pty::spawn(&argv, cols, rows)?;
         let mut em = Emulator::new(cols, rows);
-        if transport == Transport::Mosh {
+        if transport == Transport::MoshClient {
             em.screen.track_alt = false; // mosh-client draws inside the alternate screen
         }
-        Ok(Session { pty, em, cols, rows })
+        Ok(Session { link: Link::Pty(pty), em, cols, rows })
+    }
+
+    /// The descriptor that becomes readable when the remote has output.
+    pub fn fd(&self) -> libc::c_int {
+        match &self.link {
+            Link::Pty(pty) => pty.fd,
+            Link::Mosh(client) => client.fd(),
+        }
+    }
+
+    pub fn mosh(&mut self) -> Option<&mut mosh::Client> {
+        match &mut self.link {
+            Link::Mosh(client) => Some(client),
+            Link::Pty(_) => None,
+        }
+    }
+
+    /// Read pty output; 0 at EOF.  A mosh link delivers frames instead.
+    pub fn read(&mut self, buf: &mut [u8]) -> usize {
+        match &self.link {
+            Link::Pty(pty) => pty.read(buf),
+            Link::Mosh(_) => 0,
+        }
+    }
+
+    pub fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        match &mut self.link {
+            Link::Pty(pty) => pty.write(data),
+            Link::Mosh(client) => {
+                client.push_keys(data, Instant::now());
+                Ok(())
+            }
+        }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.cols = cols;
         self.rows = rows;
-        self.pty.resize(cols, rows);
-        self.em.resize(cols, rows);
+        match &mut self.link {
+            Link::Pty(pty) => {
+                pty.resize(cols, rows);
+                self.em.resize(cols, rows);
+            }
+            // The screen model follows when the server's resized frame arrives.
+            Link::Mosh(client) => client.push_resize(cols, rows, Instant::now()),
+        }
     }
 }
 

@@ -5,7 +5,7 @@ set -eu
 
 REPO=wrsrsh/tns
 TAP=wrsrsh/tap/tns
-TNS_VERSION=${TNS_VERSION:-0.6.1}
+TNS_VERSION=${TNS_VERSION:-0.7.0}
 ROLE=
 CHECK=false
 

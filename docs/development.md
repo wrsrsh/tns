@@ -12,8 +12,12 @@ Use macOS or Linux, with:
 - Python 3 with `venv` and `pip` for the terminal tests.
 - Git to clone the repository.
 
-SSH and mosh are needed for real remote-session testing, not for the fake-host
-regression tests. bash, zsh, and fish are useful for the optional hook smoke tests.
+SSH is needed for real remote-session testing, not for the fake-host
+regression tests. The tests of the built-in mosh client start a real
+`mosh-server` on this machine with a real bash, over loopback only; they are
+skipped when `mosh-server` is not installed (`brew install mosh`,
+`apt-get install mosh`). zsh and fish are useful for the optional hook smoke
+tests.
 
 ## Set up the checkout
 
@@ -41,9 +45,9 @@ bin/check
 ```
 
 This runs shell syntax checks, Rust unit tests, setup/installer regression tests,
-and the existing client/TUI PTY tests. The setup and installer tests use fake
-commands in temporary directories: they do not install packages or contact a
-real server. The TUI tests do not call an agent provider or approve permissions.
+the client/TUI PTY tests, and the built-in mosh client's end-to-end tests. The
+setup and installer tests use fake commands in temporary directories: they do
+not install packages or contact a real server. The TUI tests do not call an agent provider or approve permissions.
 The same command runs in CI on Linux and macOS.
 
 Individual suites:
@@ -55,7 +59,15 @@ cargo build --locked
 .venv/bin/python tests/install_regressions.py
 .venv/bin/python tests/client_regressions.py
 .venv/bin/python tests/tui_prediction.py
+.venv/bin/python tests/native_regressions.py
 ```
+
+`native_regressions.py` replaces `ssh` with a script that runs the "remote"
+commands locally, so tns uploads its real hooks and starts a real
+`mosh-server`. A UDP proxy between the two adds latency and outages. The Rust
+unit tests in `src/mosh.rs` also talk to a local `mosh-server` when there is
+one. `client_regressions.py` and `tui_prediction.py` cover the `--ssh` and
+`--mosh-client` paths with fake programs.
 
 The test runners accept `TNS_BIN=/absolute/path/to/tns` to test another build.
 
@@ -77,6 +89,13 @@ TNS_BIN=target/release/tns sh tests/diff_pyte.sh tests/fixtures/remote.bin 100x3
 Review the reported prefix matches; a terminal stream can be temporarily wrong
 even if its final screenshot looks correct. Historical timing measurements are
 in [benchmarks](benchmarks.md), separate from the user installation instructions.
+
+To compare typing latency with `mosh-client` over the same delayed loopback
+link (round trips of 20, 60 and 300 ms by default):
+
+```sh
+TNS_BIN=target/release/tns .venv/bin/python tests/bench_latency.py
+```
 
 ## Before a release
 

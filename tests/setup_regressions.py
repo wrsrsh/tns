@@ -89,12 +89,14 @@ print(os.environ['SSH_FACTS'])
         for mutation in ["mkdir", "chmod", "authorized_keys", "apt-get install", "cat >"]:
             self.assertNotIn(mutation, script)
 
-    def test_missing_local_mosh_has_local_instructions_and_nonzero_status(self):
+    def test_local_mosh_client_is_optional(self):
+        # tns has its own mosh client; only --mosh-client runs the program.
         (self.bin / "mosh").unlink()
         r = self.run_setup("server")
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("Run on this LOCAL machine", r.stdout)
-        self.assertNotIn("Local and remote requirements passed", r.stdout)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("no local mosh client: not required", r.stdout)
+        self.assertNotIn("Run on this LOCAL machine", r.stdout)
+        self.assertIn("Local and remote requirements passed", r.stdout)
 
     def test_missing_remote_mosh_has_remote_instructions(self):
         self.env["SSH_FACTS"] = FACTS.replace("MOSH=/usr/bin/mosh-server", "MOSH=")

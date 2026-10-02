@@ -1,5 +1,14 @@
 # Predicting an existing TUI
 
+> **Built-in mosh transport.** A plain `tns HOST` session no longer needs to
+> recognize an application to preview typing in it. The mosh server
+> acknowledges keystrokes, so tns echoes ordinary typing, Backspace and the
+> left and right arrows in any program that echoes at the cursor, after the
+> first character of a line has been seen echoed. See
+> [literal echo](architecture.md#literal-echo). The recognizer described on
+> this page is what `tns --ssh HOST` and `tns --mosh-client HOST` use, where
+> there are no acknowledgments. `--no-tui-prediction` disables either.
+
 ## Workflow
 
 Run a normal `tns HOST` session and type `claude` in its remote shell.
@@ -54,8 +63,8 @@ tns to invent a new UI. This is initial experimental support, not a promise
 that every Claude interaction or other TUI will be accelerated.
 
 `tns --no-tui-prediction HOST` disables this layer without changing the
-transport or shell prediction. Mosh remains the default transport; its own
-prediction remains disabled to avoid treating guesses as real remote output.
+transport or shell prediction. With `--mosh-client`, mosh's own prediction
+remains disabled to avoid treating guesses as real remote output.
 TUI input is held only in the current in-memory editing epoch, not written to
 the persistent shell prediction cache. Debug logs record preview/expiry events,
 not the contents of the TUI input.

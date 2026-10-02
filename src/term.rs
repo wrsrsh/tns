@@ -156,7 +156,21 @@ impl Grid {
     }
 }
 
+/// Terminal modes outside the cell grid.  The passthrough transports leave
+/// them to the real terminal; a native mosh session has to carry them when
+/// it jumps between screen states.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct Modes {
+    pub bracketed_paste: bool,
+    pub mouse: u16,          // 0, or the DECSET number 1000..=1003
+    pub mouse_encoding: u16, // 0, or 1005/1006/1015
+    pub focus: bool,
+    pub alt_scroll: bool,
+    pub reverse_video: bool,
+}
+
 /// Emulator state: a grid plus the VT state machine that mutates it.
+#[derive(Clone)]
 pub struct Screen {
     pub grid: Grid,
     attrs: Cell,
@@ -168,6 +182,12 @@ pub struct Screen {
     lnm: bool,
     pub alt: bool,
     pub cursor_visible: bool,
+    pub modes: Modes,
+    pub icon_name: Option<String>,
+    pub window_title: Option<String>,
+    /// OSC 52 payload last set, and how many times the bell rang.
+    pub clipboard: Option<String>,
+    pub bells: u32,
     alt_cursor: (usize, usize),
     pub dirty: bool,
     /// When false, DECSET 47/1047/1049 are ignored and drawing continues on
@@ -188,6 +208,11 @@ impl Screen {
             lnm: false,
             alt: false,
             cursor_visible: true,
+            modes: Modes::default(),
+            icon_name: None,
+            window_title: None,
+            clipboard: None,
+            bells: 0,
             alt_cursor: (0, 0),
             dirty: false,
             track_alt: true,
@@ -458,6 +483,14 @@ impl Screen {
         let x = self.grid.cx;
         let cell = Cell { ch: c as u32, ..self.attrs };
         let row = self.grid.row_mut(self.grid.cy);
+        // Overwriting one half of a wide character blanks the other half, as
+        // terminals do; programs (and mosh's diffs) rely on it.
+        if row[x].ch == 0 && x > 0 {
+            row[x - 1] = Cell { ch: ' ' as u32, ..row[x - 1] };
+        }
+        if x + width < cols && row[x + width].ch == 0 {
+            row[x + width] = Cell { ch: ' ' as u32, ..row[x + width] };
+        }
         row[x] = cell;
         if width == 2 && x + 1 < cols {
             row[x + 1] = Cell { ch: 0, ..self.attrs };
@@ -541,6 +574,14 @@ impl Screen {
             if private {
                 match m {
                     25 => self.cursor_visible = on,
+                    5 => self.modes.reverse_video = on,
+                    1000..=1003 if on => self.modes.mouse = m,
+                    1000..=1003 if self.modes.mouse == m => self.modes.mouse = 0,
+                    1005 | 1006 | 1015 if on => self.modes.mouse_encoding = m,
+                    1005 | 1006 | 1015 if self.modes.mouse_encoding == m => self.modes.mouse_encoding = 0,
+                    1004 => self.modes.focus = on,
+                    1007 => self.modes.alt_scroll = on,
+                    2004 => self.modes.bracketed_paste = on,
                     7 => self.autowrap = on,
                     6 => {
                         self.origin = on;
@@ -584,6 +625,9 @@ impl Perform for Screen {
     }
 
     fn execute(&mut self, byte: u8) {
+        if byte == 0x07 {
+            self.bells = self.bells.wrapping_add(1);
+        }
         if self.alt {
             return;
         }
@@ -592,6 +636,21 @@ impl Perform for Screen {
             0x09 => self.tab(),
             0x0a | 0x0b | 0x0c => self.linefeed(),
             0x0d => self.carriage_return(),
+            _ => {}
+        }
+    }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        let (Some(code), Some(text)) = (params.first(), params.get(1..)) else { return };
+        let text = || Some(String::from_utf8_lossy(&text.join(&b';')).into_owned());
+        match *code {
+            b"0" => {
+                self.icon_name = text();
+                self.window_title = text();
+            }
+            b"1" => self.icon_name = text(),
+            b"2" => self.window_title = text(),
+            b"52" => self.clipboard = text(),
             _ => {}
         }
     }
@@ -718,6 +777,21 @@ mod tests {
     }
 
     #[test]
+    fn modes_and_titles_are_tracked_for_state_jumps() {
+        let mut s = Screen::new(20, 4);
+        feed(&mut s, b"\x1b[?2004h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?1007h\x1b[?5h\x1b]0;both\x07\x1b]2;win;dow\x1b\\");
+        assert_eq!(s.modes, Modes { bracketed_paste: true, mouse: 1002, mouse_encoding: 1006, focus: true, alt_scroll: true, reverse_video: true });
+        assert_eq!((s.icon_name.as_deref(), s.window_title.as_deref()), (Some("both"), Some("win;dow")));
+        feed(&mut s, b"\x07\x1b]52;c;aGk=\x07\x07");
+        assert_eq!((s.bells, s.clipboard.as_deref()), (2, Some("c;aGk=")));
+        // Turning off a mode that is not the active one changes nothing.
+        feed(&mut s, b"\x1b[?1000l\x1b[?1015l");
+        assert_eq!((s.modes.mouse, s.modes.mouse_encoding), (1002, 1006));
+        feed(&mut s, b"\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\x1b[?1006l\x1b[?2004l");
+        assert_eq!(s.modes, Modes { focus: true, alt_scroll: true, reverse_video: true, ..Modes::default() });
+    }
+
+    #[test]
     fn basic_draw_and_wrap() {
         let mut s = Screen::new(5, 3);
         feed(&mut s, b"hello world");
@@ -781,6 +855,20 @@ mod tests {
         assert_eq!(r[1].ch, 0);
         assert_eq!(r[4].chr(), Some('x'));
         assert_eq!(s.grid.cx, 5);
+    }
+
+    #[test]
+    fn overwriting_half_a_wide_char_leaves_no_half_behind() {
+        let mut s = Screen::new(6, 1);
+        feed(&mut s, "日本".as_bytes());
+        // A narrow character over a left half, and over a right half.
+        feed(&mut s, b"\x1b[1;1Hc\x1b[1;4Hd");
+        let chars: Vec<u32> = s.grid.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(chars, ['c', ' ', ' ', 'd', ' ', ' '].map(|c| c as u32));
+        // A wide character that lands on the second half of another.
+        feed(&mut s, "\x1b[1;1H日本\x1b[1;2H語".as_bytes());
+        let chars: Vec<u32> = s.grid.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(chars, [' ' as u32, '語' as u32, 0, ' ' as u32, ' ' as u32, ' ' as u32]);
     }
 
     #[test]

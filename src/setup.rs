@@ -100,11 +100,6 @@ fn local_charmap() -> String {
         .map(|out| clean(&String::from_utf8_lossy(&out.stdout))).unwrap_or_default()
 }
 
-fn package_manager() -> String {
-    ["brew", "apt-get", "dnf", "yum", "pacman", "apk", "zypper"]
-        .into_iter().find(|p| command_path(p).is_some()).unwrap_or("").to_string()
-}
-
 fn mosh_install(pkg: &str) -> Option<&'static str> {
     match pkg {
         "brew" => Some("brew install mosh"),
@@ -240,17 +235,12 @@ fn local_checks(report: &mut Report, ssh_only: bool) -> bool {
             println!("    On Debian/Ubuntu: sudo apt-get install openssh-client");
         }
     }
+    // tns speaks mosh's protocol itself; the mosh package is only needed
+    // locally for the `--mosh-client` fallback.
     match command_path("mosh") {
-        Some(path) => report.ok("mosh", &path),
+        Some(path) => report.ok("mosh client (optional, for --mosh-client)", &path),
         None if ssh_only => report.info("mosh is not required with --ssh"),
-        None => {
-            report.missing("mosh", "required for the default transport");
-            if let Some(cmd) = mosh_install(&package_manager()) {
-                println!("    Run on this LOCAL machine:\n      {cmd}");
-            } else {
-                println!("    Install mosh with this machine's package manager.");
-            }
-        }
+        None => report.info("no local mosh client: not required, tns has its own (--mosh-client would need it)"),
     }
     let charmap = local_charmap();
     if utf8(&charmap) {
