@@ -50,9 +50,29 @@ while args and args[0].startswith('-'):
 command = args[1:]
 home = Path(os.environ['HOME'])
 if command != ['sh', '-s']:
-    # exec the last command so that killing this "ssh" ends it, as a closed
-    # connection would.
-    os.execvp('sh', ['sh', '-c', ' '.join(command).replace('; tail ', '; exec tail ')])
+    follow = re.search(r"tail -n (\+1|0) -F '?([^']+)'?$", ' '.join(command))
+    if not follow:
+        os.execvp('sh', ['sh', '-c', ' '.join(command)])
+    # The event channel: follow the file as `tail -F` would, but as late as
+    # the same link would deliver it.
+    import time
+    delay = float((home / 'delay').read_text()) / 1000 if (home / 'delay').exists() else 0
+    path = Path(follow.group(2))
+    path.touch()
+    with path.open() as events:
+        if follow.group(1) == '0':
+            events.seek(0, 2)
+        due = []
+        while True:
+            line = events.readline()
+            if line.endswith('\n'):
+                due.append((time.monotonic() + delay, line))
+            elif not due:
+                time.sleep(.005)
+            while due and (due[0][0] <= time.monotonic() or not line):
+                time.sleep(max(0, due[0][0] - time.monotonic()))
+                sys.stdout.write(due.pop(0)[1])
+                sys.stdout.flush()
 script = sys.stdin.read()
 done = subprocess.run(['sh', '-s'], input=script, capture_output=True, text=True)
 out = done.stdout

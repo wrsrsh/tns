@@ -447,7 +447,14 @@ impl PromptAnchor {
         self.pending = self.event.is_some() && !self.typed;
     }
 
+    #[cfg(test)]
     fn deadline(&self, last_out: Option<Instant>, quiet: Duration) -> Option<Instant> {
+        self.deadline_after(last_out, quiet, PROMPT_EVENT_GRACE)
+    }
+
+    /// `grace`: how long after an event that outran the screen to wait for
+    /// the screen to follow.
+    fn deadline_after(&self, last_out: Option<Instant>, quiet: Duration, grace: Duration) -> Option<Instant> {
         if !self.pending || self.typed {
             return None;
         }
@@ -457,7 +464,7 @@ impl PromptAnchor {
             if in_band || event_at.duration_since(lo) > PROMPT_EVENT_LOOKBACK {
                 return None;
             }
-            Some((lo + quiet).max(event_at + quiet.max(PROMPT_EVENT_GRACE)))
+            Some((lo + quiet).max(event_at + quiet.max(grace)))
         } else {
             Some(lo + quiet)
         }
@@ -491,6 +498,7 @@ struct Client {
     // Native mosh transport only.
     echo: echo::Predictor,
     echo_ack: u64,  // our newest input state the server reports as echoed
+    enter_num: u64, // the input state of the key that ended the last command
     shown_num: u64, // the server state on screen
     escape: bool,   // Ctrl-^ was typed; the next key completes the command
     notice: Option<String>,
@@ -704,12 +712,21 @@ impl Client {
             return None;
         }
         let mut quiet = Duration::from_millis(if !self.shared.shell.has_hooks() { 250 } else if !self.args.ssh { 120 } else { 40 });
+        let mut grace = PROMPT_EVENT_GRACE;
         if self.native() {
+            // Frames that do not yet acknowledge the key that ended the last
+            // command (late echoes of what was typed before it) are not the
+            // screen the prompt event is about.
+            if self.echo_ack < self.enter_num {
+                return None;
+            }
             // mosh-server paces its frames at half the round trip (20-250 ms):
             // a prompt still being drawn arrives one such interval later.
-            quiet = quiet.max(Duration::from_secs_f64((self.rtt / 2.0).clamp(0.02, 0.25) + 0.04));
+            let pacing = (self.rtt / 2.0).clamp(0.02, 0.25);
+            quiet = quiet.max(Duration::from_secs_f64(pacing + 0.04));
+            grace = grace.max(Duration::from_secs_f64(pacing + 0.15));
         }
-        self.prompt_anchor.deadline(self.last_out, quiet)
+        self.prompt_anchor.deadline_after(self.last_out, quiet, grace)
     }
 
     /// A lone key waiting to be learned on the native transport, before the
@@ -1074,6 +1091,7 @@ impl Client {
                         // Never reuse output from before this command/reset
                         // when its prompt event eventually arrives.
                         self.prompt_anchor = PromptAnchor::new(now, self.shared.shell.has_hooks());
+                        self.enter_num = num;
                         if !self.shared.shell.has_hooks() {
                             // no shell hooks: the command line on screen is the executed
                             // command, and the next quiet screen is the next prompt
@@ -1427,6 +1445,7 @@ fn main() {
         last_save: Instant::now(),
         echo: echo::Predictor::default(),
         echo_ack: 0,
+        enter_num: 0,
         shown_num: 0,
         escape: false,
         notice: None,

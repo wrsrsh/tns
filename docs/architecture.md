@@ -43,7 +43,10 @@ A local terminal model follows the confirmed screen. At a settled shell prompt,
 tns identifies where editable input begins and looks up previously observed
 screen changes for a given state and keystroke. A matching change can be painted
 locally before the real reply arrives. Real output restores and replaces the
-preview; uncertain or mismatched predictions are discarded.
+preview; uncertain or mismatched predictions are discarded. On the built-in
+mosh transport a prompt is only located once the server has acknowledged the
+key that ended the previous command, so late echoes of earlier typing are
+not mistaken for the new prompt's screen.
 
 ## Literal echo
 
