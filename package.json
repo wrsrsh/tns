@@ -3,18 +3,31 @@
   "version": "0.7.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "description": "Connect Pi's local interface to Claude Code and Codex over SSH",
-  "keywords": ["pi-package"],
-  "pi": { "extensions": ["./extensions/pi/index.ts"] },
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/pi/index.ts"
+    ]
+  },
   "scripts": {
     "check": "tsc --noEmit",
     "test": "node --test tests/pi-*.test.ts"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.87.1",
-    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"
+  },
+  "packageManager": "npm@11.19.1",
+  "overrides": {
+    "brace-expansion@5.0.9": "^5.0.12",
+    "brace-expansion": "^5.0.12"
   }
 }
